@@ -16,7 +16,7 @@ Join our Telegram channel for updates, support, and discussions:
 
 If you want to support development:
 
-- **USDT (BNB, ERC20)**: `0xd4140058389572D50dC8716e768e687C050Dd5C9`
+- **USDT (BEP-20)**: `0xd4140058389572D50dC8716e768e687C050Dd5C9`
 
 ## Tunnel Types
 
