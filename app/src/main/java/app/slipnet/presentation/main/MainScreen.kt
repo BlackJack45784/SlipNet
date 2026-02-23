@@ -9,16 +9,21 @@ import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.animateColorAsState
+import androidx.compose.animation.core.animateDpAsState
 import androidx.compose.animation.core.LinearEasing
 import androidx.compose.animation.core.RepeatMode
 import androidx.compose.animation.core.animateFloat
 import androidx.compose.animation.core.infiniteRepeatable
 import androidx.compose.animation.core.rememberInfiniteTransition
+import androidx.compose.animation.core.FastOutLinearInEasing
+import androidx.compose.animation.core.FastOutSlowInEasing
 import androidx.compose.animation.core.tween
+import androidx.compose.animation.expandVertically
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
 import androidx.compose.animation.scaleIn
 import androidx.compose.animation.scaleOut
+import androidx.compose.animation.shrinkVertically
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.interaction.MutableInteractionSource
@@ -45,19 +50,22 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.BugReport
+import androidx.compose.material.icons.filled.ContentCopy
 import androidx.compose.material.icons.filled.Dns
 import androidx.compose.material.icons.filled.Language
 import androidx.compose.material.icons.filled.Lock
-import androidx.compose.material.icons.filled.DriveFileMove
+import androidx.compose.material.icons.filled.MoreVert
 import androidx.compose.material.icons.filled.PowerSettingsNew
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material.icons.filled.Share
+import androidx.compose.material.icons.filled.Shield
 import androidx.compose.material.icons.filled.Waves
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.FloatingActionButton
+import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.LinearProgressIndicator
@@ -87,7 +95,10 @@ import androidx.compose.ui.draw.shadow
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.TransformOrigin
 import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalUriHandler
+import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
@@ -96,11 +107,15 @@ import androidx.compose.ui.zIndex
 import androidx.core.content.FileProvider
 import androidx.hilt.navigation.compose.hiltViewModel
 import app.slipnet.domain.model.ConnectionState
+import app.slipnet.domain.model.PingResult
 import app.slipnet.domain.model.ServerProfile
+import app.slipnet.domain.model.TrafficStats
 import app.slipnet.presentation.common.components.ProfileListItem
 import app.slipnet.presentation.common.components.QrCodeDialog
 import app.slipnet.presentation.common.icons.TorIcon
 import app.slipnet.presentation.home.DebugLogSheet
+import app.slipnet.presentation.scanner.QrScannerActivity
+import androidx.compose.material.icons.filled.Timer
 import app.slipnet.presentation.theme.ConnectedGreen
 import app.slipnet.presentation.theme.ConnectingOrange
 import app.slipnet.presentation.theme.DisconnectedRed
@@ -132,6 +147,16 @@ fun MainScreen(
     val scope = rememberCoroutineScope()
     val context = LocalContext.current
     val activity = context.findActivity()
+
+    // Handle deep link (slipnet:// URI from external QR scanner or link)
+    val mainActivity = activity as? app.slipnet.presentation.MainActivity
+    val deepLinkUri by mainActivity?.deepLinkUri?.collectAsState() ?: remember { mutableStateOf(null) }
+    LaunchedEffect(deepLinkUri) {
+        deepLinkUri?.let { uri ->
+            viewModel.parseImportConfig(uri)
+            mainActivity?.consumeDeepLink()
+        }
+    }
 
     // VPN permission flow
     var pendingConnect by remember { mutableStateOf(false) }
@@ -212,15 +237,34 @@ fun MainScreen(
 
     val navBarPadding = WindowInsets.navigationBars.asPaddingValues()
 
+    val showTorProgressFab = uiState.connectionState is ConnectionState.Connecting &&
+            uiState.snowflakeBootstrapProgress in 0..99
+
+    val sleepTimerActive = uiState.connectionState is ConnectionState.Connected &&
+            uiState.sleepTimerRemainingSeconds > 0
+
+    val fabExtraPadding by animateDpAsState(
+        targetValue = when {
+            uiState.connectionState is ConnectionState.Connected && sleepTimerActive -> 52.dp
+            uiState.connectionState is ConnectionState.Connected -> 28.dp
+            showTorProgressFab -> 30.dp
+            else -> 0.dp
+        },
+        animationSpec = tween(300),
+        label = "fabPadding"
+    )
+
     // Helper to request VPN permission and connect
     fun requestConnectOrToggle() {
         when (uiState.connectionState) {
             is ConnectionState.Connected,
             is ConnectionState.Connecting -> viewModel.disconnect()
             else -> {
-                if (uiState.proxyOnlyMode) {
-                    viewModel.connect()
-                } else if (activity != null) {
+                if (activity != null) {
+                    // Always check VpnService.prepare() — even in proxy-only mode.
+                    // This detects if another VPN (e.g. v2ray) is active. Without this,
+                    // our tunnel sockets route through the other VPN and fail silently.
+                    // Granting permission revokes the other VPN, unblocking our tunnel.
                     val vpnIntent = VpnService.prepare(activity)
                     if (vpnIntent != null) {
                         pendingConnect = true
@@ -253,15 +297,28 @@ fun MainScreen(
                     IconButton(onClick = { showShareDialog = true }) {
                         Icon(Icons.Default.Share, contentDescription = "Share App")
                     }
-                    // Overflow menu
+                    IconButton(onClick = onNavigateToSettings) {
+                        Icon(Icons.Default.Settings, contentDescription = "Settings")
+                    }
+                    // Overflow menu (three-dot, rightmost)
                     Box {
                         IconButton(onClick = { showOverflowMenu = true }) {
-                            Icon(Icons.Default.DriveFileMove, contentDescription = "Import & Export")
+                            Icon(Icons.Default.MoreVert, contentDescription = "More")
                         }
                         DropdownMenu(
                             expanded = showOverflowMenu,
                             onDismissRequest = { showOverflowMenu = false }
                         ) {
+                            DropdownMenuItem(
+                                text = {
+                                    Text(if (uiState.isPingRunning) "Stop Reachability Test" else "Test Server Reachability")
+                                },
+                                onClick = {
+                                    showOverflowMenu = false
+                                    viewModel.pingAllProfiles()
+                                },
+                                enabled = uiState.profiles.isNotEmpty()
+                            )
                             DropdownMenuItem(
                                 text = { Text("Export All Profiles") },
                                 onClick = {
@@ -287,9 +344,6 @@ fun MainScreen(
                             )
                         }
                     }
-                    IconButton(onClick = onNavigateToSettings) {
-                        Icon(Icons.Default.Settings, contentDescription = "Settings")
-                    }
                 },
                 colors = TopAppBarDefaults.topAppBarColors(
                     containerColor = Color.Transparent
@@ -302,13 +356,26 @@ fun MainScreen(
             ) {
                 AnimatedVisibility(
                     visible = showAddMenu,
-                    enter = scaleIn(transformOrigin = TransformOrigin(1f, 1f)) + fadeIn(),
-                    exit = scaleOut(transformOrigin = TransformOrigin(1f, 1f)) + fadeOut()
+                    enter = scaleIn(
+                        animationSpec = tween(150, easing = FastOutSlowInEasing),
+                        transformOrigin = TransformOrigin(1f, 1f),
+                        initialScale = 0.8f
+                    ) + fadeIn(tween(100)) + expandVertically(
+                        animationSpec = tween(150, easing = FastOutSlowInEasing),
+                        expandFrom = Alignment.Top
+                    ),
+                    exit = scaleOut(
+                        animationSpec = tween(100, easing = FastOutLinearInEasing),
+                        transformOrigin = TransformOrigin(1f, 1f),
+                        targetScale = 0.8f
+                    ) + fadeOut(tween(75)) + shrinkVertically(
+                        animationSpec = tween(100, easing = FastOutLinearInEasing),
+                        shrinkTowards = Alignment.Top
+                    )
                 ) {
                     Surface(
                         shape = RoundedCornerShape(16.dp),
                         tonalElevation = 4.dp,
-                        shadowElevation = 8.dp,
                         modifier = Modifier.padding(bottom = 12.dp, end = 8.dp)
                     ) {
                         Column(
@@ -353,6 +420,15 @@ fun MainScreen(
                                 }
                             )
                             AddMenuOption(
+                                icon = Icons.Default.Shield,
+                                title = "SlipGate",
+                                description = "NaiveProxy + SSH",
+                                onClick = {
+                                    showAddMenu = false
+                                    onNavigateToAddProfile("naive_ssh")
+                                }
+                            )
+                            AddMenuOption(
                                 icon = TorIcon,
                                 title = "Tor",
                                 description = "Connect via Tor network",
@@ -381,7 +457,7 @@ fun MainScreen(
                     snowflakeBootstrapProgress = uiState.snowflakeBootstrapProgress,
                     onToggleConnection = { requestConnectOrToggle() },
                     modifier = Modifier.padding(
-                        bottom = 24.dp + navBarPadding.calculateBottomPadding(),
+                        bottom = 24.dp + navBarPadding.calculateBottomPadding() + fabExtraPadding,
                         end = 8.dp
                     )
                 )
@@ -457,6 +533,7 @@ fun MainScreen(
                                     profile = profile,
                                     isSelected = profile.isActive,
                                     isConnected = isConnected,
+                                    pingResult = uiState.pingResults[profile.id],
                                     onClick = { viewModel.setActiveProfile(profile) },
                                     onEditClick = { onNavigateToEditProfile(profile.id) },
                                     onDeleteClick = {
@@ -488,6 +565,13 @@ fun MainScreen(
                 connectionState = uiState.connectionState,
                 activeProfile = uiState.activeProfile,
                 isProxyOnly = uiState.proxyOnlyMode,
+                snowflakeBootstrapProgress = uiState.snowflakeBootstrapProgress,
+                uploadSpeed = uiState.uploadSpeed,
+                downloadSpeed = uiState.downloadSpeed,
+                totalUpload = uiState.trafficStats.bytesSent,
+                totalDownload = uiState.trafficStats.bytesReceived,
+                sleepTimerRemainingSeconds = uiState.sleepTimerRemainingSeconds,
+                onCancelSleepTimer = { viewModel.userCancelSleepTimer() },
                 modifier = Modifier
                     .align(Alignment.BottomCenter)
                     .padding(bottom = navBarPadding.calculateBottomPadding())
@@ -567,17 +651,11 @@ fun MainScreen(
 
     // Delete all confirmation dialog
     if (showDeleteAllDialog) {
-        val hasConnected = uiState.connectedProfileId != null
         AlertDialog(
             onDismissRequest = { showDeleteAllDialog = false },
             title = { Text("Delete All Profiles") },
             text = {
-                Text(
-                    if (hasConnected)
-                        "Are you sure you want to delete all profiles? The currently connected profile will be kept."
-                    else
-                        "Are you sure you want to delete all profiles? This cannot be undone."
-                )
+                Text("Are you sure you want to delete all profiles? This cannot be undone.")
             },
             confirmButton = {
                 TextButton(
@@ -693,8 +771,9 @@ fun MainScreen(
                                 importText = ""
                                 qrScanLauncher.launch(ScanOptions().apply {
                                     setDesiredBarcodeFormats(ScanOptions.QR_CODE)
-                                    setPrompt("Scan a SlipNet QR code")
+                                    setPrompt("")
                                     setBeepEnabled(false)
+                                    setCaptureActivity(QrScannerActivity::class.java)
                                 })
                             }
                         ) { Text("Scan QR Code") }
@@ -723,6 +802,94 @@ fun MainScreen(
             }
         )
     }
+
+    // First launch About dialog
+    if (uiState.showFirstLaunchAbout) {
+        val clipboardManager = LocalClipboardManager.current
+        val uriHandler = LocalUriHandler.current
+        val donationAddress = "0xd4140058389572D50dC8716e768e687C050Dd5C9"
+
+        AlertDialog(
+            onDismissRequest = { viewModel.dismissFirstLaunchAbout() },
+            title = { Text("Welcome to SlipNet") },
+            text = {
+                Column(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalArrangement = Arrangement.spacedBy(12.dp)
+                ) {
+                    Text(
+                        text = "SlipNet VPN v${app.slipnet.BuildConfig.VERSION_NAME}",
+                        style = MaterialTheme.typography.titleMedium
+                    )
+                    Text(
+                        text = "A free, source-available anti-censorship VPN tool designed to bypass internet restrictions. SlipNet tunnels your traffic through DNS, SSH, Tor, and other protocols to keep you connected when access is blocked.",
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+
+                    HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.5f))
+
+                    // GitHub
+                    Text(
+                        text = "GitHub",
+                        style = MaterialTheme.typography.labelLarge,
+                        color = MaterialTheme.colorScheme.primary
+                    )
+                    Text(
+                        text = "github.com/anonvector/SlipNet",
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = MaterialTheme.colorScheme.primary,
+                        modifier = Modifier.clickable {
+                            uriHandler.openUri("https://github.com/anonvector/SlipNet")
+                        }
+                    )
+
+                    HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.5f))
+
+                    // Donate
+                    Text(
+                        text = "Donate (USDT \u2013 BEP20 / ERC20)",
+                        style = MaterialTheme.typography.labelLarge,
+                        color = MaterialTheme.colorScheme.primary
+                    )
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Text(
+                            text = donationAddress,
+                            style = MaterialTheme.typography.bodySmall,
+                            modifier = Modifier.weight(1f),
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis
+                        )
+                        IconButton(
+                            onClick = {
+                                clipboardManager.setText(AnnotatedString(donationAddress))
+                            },
+                            modifier = Modifier.size(32.dp)
+                        ) {
+                            Icon(
+                                Icons.Default.ContentCopy,
+                                contentDescription = "Copy donation address",
+                                modifier = Modifier.size(18.dp)
+                            )
+                        }
+                    }
+                    Text(
+                        text = "Your support helps keep this project alive and free for everyone.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
+            },
+            confirmButton = {
+                TextButton(onClick = { viewModel.dismissFirstLaunchAbout() }) {
+                    Text("Get Started")
+                }
+            }
+        )
+    }
 }
 
 // ── ConnectionStatusStrip ───────────────────────────────────────────────
@@ -732,12 +899,21 @@ private fun ConnectionStatusStrip(
     connectionState: ConnectionState,
     activeProfile: ServerProfile?,
     isProxyOnly: Boolean,
+    snowflakeBootstrapProgress: Int,
+    uploadSpeed: Long = 0,
+    downloadSpeed: Long = 0,
+    totalUpload: Long = 0,
+    totalDownload: Long = 0,
+    sleepTimerRemainingSeconds: Int = 0,
+    onCancelSleepTimer: () -> Unit = {},
     modifier: Modifier = Modifier
 ) {
     val isConnected = connectionState is ConnectionState.Connected
     val isConnecting = connectionState is ConnectionState.Connecting ||
             connectionState is ConnectionState.Disconnecting
     val isError = connectionState is ConnectionState.Error
+    val showTorProgress = connectionState is ConnectionState.Connecting &&
+            snowflakeBootstrapProgress in 0..99
 
     val statusColor by animateColorAsState(
         targetValue = when {
@@ -753,58 +929,175 @@ private fun ConnectionStatusStrip(
     Surface(
         modifier = modifier.fillMaxWidth(),
         tonalElevation = 2.dp,
-        shape = RoundedCornerShape(topStart = 16.dp, topEnd = 16.dp)
+        shape = RoundedCornerShape(16.dp)
     ) {
-        Row(
+        Column(
             modifier = Modifier
                 .fillMaxWidth()
-                .padding(horizontal = 16.dp, vertical = 12.dp),
-            verticalAlignment = Alignment.CenterVertically
+                .padding(horizontal = 16.dp, vertical = 16.dp)
         ) {
-            // Status indicator dot
-            Box(
-                modifier = Modifier
-                    .size(10.dp)
-                    .clip(CircleShape)
-                    .background(statusColor)
-            )
-
-            Spacer(modifier = Modifier.width(12.dp))
-
-            // Status text + profile name
-            Column(modifier = Modifier.weight(1f)) {
-                Text(
-                    text = when {
-                        isConnected && isProxyOnly -> "Proxy Active"
-                        isConnected -> "Connected"
-                        connectionState is ConnectionState.Connecting -> "Connecting..."
-                        connectionState is ConnectionState.Disconnecting -> "Disconnecting..."
-                        isError -> "Connection Failed"
-                        else -> "Not Connected"
-                    },
-                    style = MaterialTheme.typography.titleMedium,
-                    fontWeight = FontWeight.SemiBold,
-                    color = if (isConnected || isConnecting) statusColor
-                    else MaterialTheme.colorScheme.onBackground
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                // Status indicator dot
+                Box(
+                    modifier = Modifier
+                        .size(10.dp)
+                        .clip(CircleShape)
+                        .background(statusColor)
                 )
-                Text(
-                    text = when {
-                        isConnected && connectionState is ConnectionState.Connected ->
-                            connectionState.profile.name
-                        isError && connectionState is ConnectionState.Error ->
-                            connectionState.message
-                        activeProfile != null -> activeProfile.name
-                        else -> "No profile selected"
-                    },
-                    style = MaterialTheme.typography.bodySmall,
-                    color = if (isError) DisconnectedRed
-                    else MaterialTheme.colorScheme.onSurfaceVariant,
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis
-                )
+
+                Spacer(modifier = Modifier.width(12.dp))
+
+                // Status text + profile name
+                Column(modifier = Modifier.weight(1f)) {
+                    Text(
+                        text = when {
+                            isConnected && isProxyOnly -> "Proxy Active"
+                            isConnected -> "Connected"
+                            connectionState is ConnectionState.Connecting -> "Connecting..."
+                            connectionState is ConnectionState.Disconnecting -> "Disconnecting..."
+                            isError -> "Connection Failed"
+                            else -> "Not Connected"
+                        },
+                        style = MaterialTheme.typography.titleMedium,
+                        fontWeight = FontWeight.SemiBold,
+                        color = if (isConnected || isConnecting) statusColor
+                        else MaterialTheme.colorScheme.onBackground
+                    )
+                    Text(
+                        text = when {
+                            isConnected && connectionState is ConnectionState.Connected ->
+                                connectionState.profile.name
+                            isError && connectionState is ConnectionState.Error ->
+                                connectionState.message
+                            activeProfile != null -> activeProfile.name
+                            else -> "No profile selected"
+                        },
+                        style = MaterialTheme.typography.bodySmall,
+                        color = if (isError) DisconnectedRed
+                        else MaterialTheme.colorScheme.onSurfaceVariant,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis
+                    )
+                }
+            }
+
+            // Traffic stats: live speed + totals when connected, session totals when disconnected
+            AnimatedVisibility(
+                visible = isConnected,
+                enter = expandVertically(animationSpec = tween(300)) + fadeIn(animationSpec = tween(300)),
+                exit = shrinkVertically(animationSpec = tween(200)) + fadeOut(animationSpec = tween(200))
+            ) {
+                Column {
+                    Spacer(modifier = Modifier.height(8.dp))
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(start = 22.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        // Live speed
+                        Text(
+                            text = "\u2191 ${TrafficStats.formatBytes(uploadSpeed)}/s",
+                            style = MaterialTheme.typography.labelMedium,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                        Spacer(modifier = Modifier.width(16.dp))
+                        Text(
+                            text = "\u2193 ${TrafficStats.formatBytes(downloadSpeed)}/s",
+                            style = MaterialTheme.typography.labelMedium,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                        Spacer(modifier = Modifier.weight(1f))
+                        // Session totals
+                        Text(
+                            text = "\u2191 ${TrafficStats.formatBytes(totalUpload)}  \u2193 ${TrafficStats.formatBytes(totalDownload)}",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.6f)
+                        )
+                    }
+                }
+            }
+
+            // Sleep timer countdown
+            AnimatedVisibility(
+                visible = isConnected && sleepTimerRemainingSeconds > 0,
+                enter = expandVertically(animationSpec = tween(300)) + fadeIn(animationSpec = tween(300)),
+                exit = shrinkVertically(animationSpec = tween(200)) + fadeOut(animationSpec = tween(200))
+            ) {
+                Column {
+                    Spacer(modifier = Modifier.height(8.dp))
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(start = 22.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Icon(
+                            Icons.Default.Timer,
+                            contentDescription = null,
+                            modifier = Modifier.size(16.dp),
+                            tint = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                        Spacer(modifier = Modifier.width(6.dp))
+                        Text(
+                            text = "Sleep: ${formatCountdown(sleepTimerRemainingSeconds)}",
+                            style = MaterialTheme.typography.labelMedium,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                        Spacer(modifier = Modifier.weight(1f))
+                        TextButton(
+                            onClick = onCancelSleepTimer,
+                            contentPadding = PaddingValues(horizontal = 8.dp, vertical = 0.dp),
+                            modifier = Modifier.height(28.dp)
+                        ) {
+                            Text(
+                                text = "Cancel",
+                                style = MaterialTheme.typography.labelSmall
+                            )
+                        }
+                    }
+                }
+            }
+
+            // Tor bootstrap progress
+            AnimatedVisibility(
+                visible = showTorProgress,
+                enter = expandVertically(animationSpec = tween(300)) + fadeIn(animationSpec = tween(300)),
+                exit = shrinkVertically(animationSpec = tween(200)) + fadeOut(animationSpec = tween(200))
+            ) {
+                Column {
+                    Spacer(modifier = Modifier.height(12.dp))
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        LinearProgressIndicator(
+                            progress = { snowflakeBootstrapProgress / 100f },
+                            modifier = Modifier
+                                .weight(1f)
+                                .height(6.dp)
+                                .clip(RoundedCornerShape(3.dp)),
+                            color = ConnectingOrange,
+                            trackColor = ConnectingOrange.copy(alpha = 0.2f),
+                        )
+                        Spacer(modifier = Modifier.width(12.dp))
+                        Text(
+                            text = "Tor: $snowflakeBootstrapProgress%",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = ConnectingOrange
+                        )
+                    }
+                }
             }
         }
     }
+}
+
+private fun formatCountdown(totalSeconds: Int): String {
+    return "%d:%02d".format(totalSeconds / 60, totalSeconds % 60)
 }
 
 // ── Connect FAB ─────────────────────────────────────────────────────────
@@ -847,16 +1140,6 @@ private fun ConnectFab(
         horizontalAlignment = Alignment.CenterHorizontally,
         modifier = modifier
     ) {
-        // Snowflake bootstrap progress above the FAB
-        if (connectionState is ConnectionState.Connecting && snowflakeBootstrapProgress in 0..99) {
-            Text(
-                text = "Tor: $snowflakeBootstrapProgress%",
-                style = MaterialTheme.typography.labelSmall,
-                color = ConnectingOrange,
-                modifier = Modifier.padding(bottom = 4.dp)
-            )
-        }
-
         FloatingActionButton(
             onClick = onToggleConnection,
             containerColor = statusColor,

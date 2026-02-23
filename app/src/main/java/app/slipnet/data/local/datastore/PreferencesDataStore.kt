@@ -10,8 +10,11 @@ import androidx.datastore.preferences.core.longPreferencesKey
 import androidx.datastore.preferences.core.stringPreferencesKey
 import androidx.datastore.preferences.preferencesDataStore
 import dagger.hilt.android.qualifiers.ApplicationContext
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.map
+import kotlinx.coroutines.withContext
+import java.io.File
 import javax.inject.Inject
 import javax.inject.Singleton
 
@@ -47,6 +50,7 @@ class PreferencesDataStore @Inject constructor(
         val SSH_CIPHER = stringPreferencesKey("ssh_cipher")
         val SSH_COMPRESSION = booleanPreferencesKey("ssh_compression")
         val SSH_MAX_CHANNELS = intPreferencesKey("ssh_max_channels")
+        val SSH_MAX_CHANNELS_CUSTOM = booleanPreferencesKey("ssh_max_channels_custom")
         // Split Tunneling Keys
         val SPLIT_TUNNELING_ENABLED = booleanPreferencesKey("split_tunneling_enabled")
         val SPLIT_TUNNELING_MODE = stringPreferencesKey("split_tunneling_mode")
@@ -57,12 +61,25 @@ class PreferencesDataStore @Inject constructor(
         val APPEND_HTTP_PROXY_TO_VPN = booleanPreferencesKey("append_http_proxy_to_vpn")
         // Proxy-Only Mode
         val PROXY_ONLY_MODE = booleanPreferencesKey("proxy_only_mode")
+        // Kill Switch
+        val KILL_SWITCH = booleanPreferencesKey("kill_switch")
+        // Sleep Timer
+        val SLEEP_TIMER_MINUTES = intPreferencesKey("sleep_timer_minutes")
         // Recent DNS Resolvers
         val RECENT_DNS_RESOLVERS = stringPreferencesKey("recent_dns_resolvers")
+        // First Launch
+        val FIRST_LAUNCH_DONE = booleanPreferencesKey("first_launch_done")
         // Domain Routing Keys
         val DOMAIN_ROUTING_ENABLED = booleanPreferencesKey("domain_routing_enabled")
         val DOMAIN_ROUTING_MODE = stringPreferencesKey("domain_routing_mode")
         val DOMAIN_ROUTING_DOMAINS = stringPreferencesKey("domain_routing_domains")
+        // Geo-Bypass Keys
+        val GEO_BYPASS_ENABLED = booleanPreferencesKey("geo_bypass_enabled")
+        val GEO_BYPASS_COUNTRY = stringPreferencesKey("geo_bypass_country")
+        // Remote DNS Keys
+        val REMOTE_DNS_MODE = stringPreferencesKey("remote_dns_mode")
+        val CUSTOM_REMOTE_DNS = stringPreferencesKey("custom_remote_dns")
+        val CUSTOM_REMOTE_DNS_FALLBACK = stringPreferencesKey("custom_remote_dns_fallback")
     }
 
     // Auto-connect on boot
@@ -255,9 +272,21 @@ class PreferencesDataStore @Inject constructor(
         prefs[Keys.SSH_MAX_CHANNELS] ?: 16
     }
 
+    val sshMaxChannelsIsCustom: Flow<Boolean> = dataStore.data.map { prefs ->
+        prefs[Keys.SSH_MAX_CHANNELS_CUSTOM] ?: false
+    }
+
     suspend fun setSshMaxChannels(count: Int) {
         dataStore.edit { prefs ->
             prefs[Keys.SSH_MAX_CHANNELS] = count.coerceIn(4, 64)
+            prefs[Keys.SSH_MAX_CHANNELS_CUSTOM] = true
+        }
+    }
+
+    suspend fun resetSshMaxChannelsToAuto() {
+        dataStore.edit { prefs ->
+            prefs.remove(Keys.SSH_MAX_CHANNELS)
+            prefs.remove(Keys.SSH_MAX_CHANNELS_CUSTOM)
         }
     }
 
@@ -368,6 +397,39 @@ class PreferencesDataStore @Inject constructor(
         }
     }
 
+    // Kill Switch
+    val killSwitch: Flow<Boolean> = dataStore.data.map { prefs ->
+        prefs[Keys.KILL_SWITCH] ?: false
+    }
+
+    suspend fun setKillSwitch(enabled: Boolean) {
+        dataStore.edit { prefs ->
+            prefs[Keys.KILL_SWITCH] = enabled
+        }
+    }
+
+    // Sleep Timer
+    val sleepTimerMinutes: Flow<Int> = dataStore.data.map { prefs ->
+        prefs[Keys.SLEEP_TIMER_MINUTES] ?: 0
+    }
+
+    suspend fun setSleepTimerMinutes(minutes: Int) {
+        dataStore.edit { prefs ->
+            prefs[Keys.SLEEP_TIMER_MINUTES] = minutes.coerceIn(0, 120)
+        }
+    }
+
+    // First Launch
+    val firstLaunchDone: Flow<Boolean> = dataStore.data.map { prefs ->
+        prefs[Keys.FIRST_LAUNCH_DONE] ?: false
+    }
+
+    suspend fun setFirstLaunchDone() {
+        dataStore.edit { prefs ->
+            prefs[Keys.FIRST_LAUNCH_DONE] = true
+        }
+    }
+
     // Domain Routing Settings
     val domainRoutingEnabled: Flow<Boolean> = dataStore.data.map { prefs ->
         prefs[Keys.DOMAIN_ROUTING_ENABLED] ?: false
@@ -404,6 +466,108 @@ class PreferencesDataStore @Inject constructor(
         dataStore.edit { prefs ->
             prefs[Keys.DOMAIN_ROUTING_DOMAINS] = org.json.JSONArray(domains.toList()).toString()
         }
+    }
+
+    // Geo-Bypass Settings
+    val geoBypassEnabled: Flow<Boolean> = dataStore.data.map { prefs ->
+        prefs[Keys.GEO_BYPASS_ENABLED] ?: false
+    }
+
+    suspend fun setGeoBypassEnabled(enabled: Boolean) {
+        dataStore.edit { prefs ->
+            prefs[Keys.GEO_BYPASS_ENABLED] = enabled
+        }
+    }
+
+    val geoBypassCountry: Flow<String> = dataStore.data.map { prefs ->
+        prefs[Keys.GEO_BYPASS_COUNTRY] ?: "ir"
+    }
+
+    suspend fun setGeoBypassCountry(country: String) {
+        dataStore.edit { prefs ->
+            prefs[Keys.GEO_BYPASS_COUNTRY] = country
+        }
+    }
+
+    // Remote DNS Settings
+    val remoteDnsMode: Flow<String> = dataStore.data.map { prefs ->
+        prefs[Keys.REMOTE_DNS_MODE] ?: "default"
+    }
+
+    suspend fun setRemoteDnsMode(mode: String) {
+        dataStore.edit { prefs ->
+            prefs[Keys.REMOTE_DNS_MODE] = mode
+        }
+    }
+
+    val customRemoteDns: Flow<String> = dataStore.data.map { prefs ->
+        prefs[Keys.CUSTOM_REMOTE_DNS] ?: ""
+    }
+
+    suspend fun setCustomRemoteDns(dns: String) {
+        dataStore.edit { prefs ->
+            prefs[Keys.CUSTOM_REMOTE_DNS] = dns
+        }
+    }
+
+    val customRemoteDnsFallback: Flow<String> = dataStore.data.map { prefs ->
+        prefs[Keys.CUSTOM_REMOTE_DNS_FALLBACK] ?: ""
+    }
+
+    suspend fun setCustomRemoteDnsFallback(dns: String) {
+        dataStore.edit { prefs ->
+            prefs[Keys.CUSTOM_REMOTE_DNS_FALLBACK] = dns
+        }
+    }
+
+    companion object {
+        const val DEFAULT_REMOTE_DNS = "8.8.8.8"
+        const val DEFAULT_REMOTE_DNS_FALLBACK = "1.1.1.1"
+    }
+
+    /**
+     * Returns the effective primary remote DNS server IP.
+     * "8.8.8.8" for default mode, or the custom IP when custom mode is selected.
+     */
+    fun getEffectiveRemoteDns(): Flow<String> = dataStore.data.map { prefs ->
+        val mode = prefs[Keys.REMOTE_DNS_MODE] ?: "default"
+        if (mode == "custom") {
+            val custom = prefs[Keys.CUSTOM_REMOTE_DNS] ?: ""
+            custom.ifBlank { DEFAULT_REMOTE_DNS }
+        } else {
+            DEFAULT_REMOTE_DNS
+        }
+    }
+
+    /**
+     * Returns the effective fallback remote DNS server IP.
+     * "1.1.1.1" for default mode, or the custom fallback when custom mode is selected.
+     */
+    fun getEffectiveRemoteDnsFallback(): Flow<String> = dataStore.data.map { prefs ->
+        val mode = prefs[Keys.REMOTE_DNS_MODE] ?: "default"
+        if (mode == "custom") {
+            val custom = prefs[Keys.CUSTOM_REMOTE_DNS_FALLBACK] ?: ""
+            custom.ifBlank { DEFAULT_REMOTE_DNS_FALLBACK }
+        } else {
+            DEFAULT_REMOTE_DNS_FALLBACK
+        }
+    }
+
+    // Scan Session (file-based — can be large with 10K+ resolvers)
+    private val scanSessionFile: File
+        get() = File(context.cacheDir, "scan_session.json")
+
+    suspend fun saveScanSession(json: String) = withContext(Dispatchers.IO) {
+        scanSessionFile.writeText(json)
+    }
+
+    suspend fun getSavedScanSession(): String? = withContext(Dispatchers.IO) {
+        val file = scanSessionFile
+        if (file.exists()) file.readText() else null
+    }
+
+    suspend fun clearScanSession() = withContext(Dispatchers.IO) {
+        scanSessionFile.delete()
     }
 }
 

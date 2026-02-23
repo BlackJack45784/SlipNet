@@ -7,6 +7,7 @@ import app.slipnet.data.local.datastore.DomainRoutingMode
 import app.slipnet.data.local.datastore.PreferencesDataStore
 import app.slipnet.data.local.datastore.SplitTunnelingMode
 import app.slipnet.data.local.datastore.SshCipher
+import app.slipnet.tunnel.GeoBypassCountry
 import dagger.hilt.android.lifecycle.HiltViewModel
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -24,6 +25,8 @@ data class SettingsUiState(
     val proxyListenAddress: String = "0.0.0.0",
     val proxyListenPort: Int = 1080,
     val proxyOnlyMode: Boolean = false,
+    val killSwitch: Boolean = false,
+    val sleepTimerMinutes: Int = 0,
     // HTTP Proxy Settings
     val httpProxyEnabled: Boolean = false,
     val httpProxyPort: Int = 8080,
@@ -38,10 +41,18 @@ data class SettingsUiState(
     val sshCipher: SshCipher = SshCipher.AUTO,
     val sshCompression: Boolean = false,
     val sshMaxChannels: Int = 16,
+    val sshMaxChannelsIsCustom: Boolean = false,
     // Domain Routing Settings
     val domainRoutingEnabled: Boolean = false,
     val domainRoutingMode: DomainRoutingMode = DomainRoutingMode.BYPASS,
-    val domainRoutingDomains: Set<String> = emptySet()
+    val domainRoutingDomains: Set<String> = emptySet(),
+    // Geo-Bypass Settings
+    val geoBypassEnabled: Boolean = false,
+    val geoBypassCountry: GeoBypassCountry = GeoBypassCountry.IR,
+    // Remote DNS Settings
+    val remoteDnsMode: String = "default",
+    val customRemoteDns: String = "",
+    val customRemoteDnsFallback: String = ""
 )
 
 @HiltViewModel
@@ -69,12 +80,14 @@ class SettingsViewModel @Inject constructor(
                 arrayOf(values[0], values[1], values[2], values[3], values[4], values[5])
             }
 
+            data class SshSettings(val cipher: SshCipher, val compression: Boolean, val maxChannels: Int, val maxChannelsIsCustom: Boolean)
             val sshFlow = combine(
                 preferencesDataStore.sshCipher,
                 preferencesDataStore.sshCompression,
-                preferencesDataStore.sshMaxChannels
-            ) { cipher, compression, maxChannels ->
-                Triple(cipher, compression, maxChannels)
+                preferencesDataStore.sshMaxChannels,
+                preferencesDataStore.sshMaxChannelsIsCustom
+            ) { cipher, compression, maxChannels, isCustom ->
+                SshSettings(cipher, compression, maxChannels, isCustom)
             }
 
             val splitFlow = combine(
@@ -85,7 +98,13 @@ class SettingsViewModel @Inject constructor(
                 Triple(enabled, mode, apps)
             }
 
-            val proxyOnlyFlow = preferencesDataStore.proxyOnlyMode
+            val proxyOnlyFlow = combine(
+                preferencesDataStore.proxyOnlyMode,
+                preferencesDataStore.killSwitch,
+                preferencesDataStore.sleepTimerMinutes
+            ) { proxyOnly, killSwitch, sleepTimer ->
+                Triple(proxyOnly, killSwitch, sleepTimer)
+            }
 
             val httpProxyFlow = combine(
                 preferencesDataStore.httpProxyEnabled,
@@ -103,7 +122,22 @@ class SettingsViewModel @Inject constructor(
                 Triple(enabled, mode, domains)
             }
 
-            val baseFlow = combine(mainFlow, sshFlow, splitFlow, proxyOnlyFlow, httpProxyFlow) { main, ssh, split, proxyOnly, httpProxy ->
+            val geoBypassFlow = combine(
+                preferencesDataStore.geoBypassEnabled,
+                preferencesDataStore.geoBypassCountry
+            ) { enabled, countryCode ->
+                Pair(enabled, GeoBypassCountry.fromCode(countryCode))
+            }
+
+            val remoteDnsFlow = combine(
+                preferencesDataStore.remoteDnsMode,
+                preferencesDataStore.customRemoteDns,
+                preferencesDataStore.customRemoteDnsFallback
+            ) { mode, customDns, customFallback ->
+                Triple(mode, customDns, customFallback)
+            }
+
+            val baseFlow = combine(mainFlow, sshFlow, splitFlow, proxyOnlyFlow, httpProxyFlow) { main, ssh, split, proxyOnlyTriple, httpProxy ->
                 SettingsUiState(
                     autoConnectOnBoot = main[0] as Boolean,
                     darkMode = main[1] as DarkMode,
@@ -111,7 +145,9 @@ class SettingsViewModel @Inject constructor(
                     isLoading = false,
                     proxyListenAddress = main[3] as String,
                     proxyListenPort = main[4] as Int,
-                    proxyOnlyMode = proxyOnly,
+                    proxyOnlyMode = proxyOnlyTriple.first,
+                    killSwitch = proxyOnlyTriple.second,
+                    sleepTimerMinutes = proxyOnlyTriple.third,
                     httpProxyEnabled = httpProxy.first,
                     httpProxyPort = httpProxy.second,
                     appendHttpProxyToVpn = httpProxy.third,
@@ -119,17 +155,33 @@ class SettingsViewModel @Inject constructor(
                     splitTunnelingEnabled = split.first,
                     splitTunnelingMode = split.second,
                     splitTunnelingApps = split.third,
-                    sshCipher = ssh.first,
-                    sshCompression = ssh.second,
-                    sshMaxChannels = ssh.third
+                    sshCipher = ssh.cipher,
+                    sshCompression = ssh.compression,
+                    sshMaxChannels = ssh.maxChannels,
+                    sshMaxChannelsIsCustom = ssh.maxChannelsIsCustom
                 )
             }
 
-            combine(baseFlow, domainRoutingFlow) { base, domainRouting ->
+            val routingFlow = combine(baseFlow, domainRoutingFlow) { base, domainRouting ->
                 base.copy(
                     domainRoutingEnabled = domainRouting.first,
                     domainRoutingMode = domainRouting.second,
                     domainRoutingDomains = domainRouting.third
+                )
+            }
+
+            val withGeoFlow = combine(routingFlow, geoBypassFlow) { state, geoBypass ->
+                state.copy(
+                    geoBypassEnabled = geoBypass.first,
+                    geoBypassCountry = geoBypass.second
+                )
+            }
+
+            combine(withGeoFlow, remoteDnsFlow) { state, remoteDns ->
+                state.copy(
+                    remoteDnsMode = remoteDns.first,
+                    customRemoteDns = remoteDns.second,
+                    customRemoteDnsFallback = remoteDns.third
                 )
             }.collect { newState ->
                 _uiState.value = newState
@@ -159,6 +211,20 @@ class SettingsViewModel @Inject constructor(
     fun setProxyOnlyMode(enabled: Boolean) {
         viewModelScope.launch {
             preferencesDataStore.setProxyOnlyMode(enabled)
+        }
+    }
+
+    // Kill Switch
+    fun setKillSwitch(enabled: Boolean) {
+        viewModelScope.launch {
+            preferencesDataStore.setKillSwitch(enabled)
+        }
+    }
+
+    // Sleep Timer
+    fun setSleepTimerMinutes(minutes: Int) {
+        viewModelScope.launch {
+            preferencesDataStore.setSleepTimerMinutes(minutes)
         }
     }
 
@@ -214,6 +280,12 @@ class SettingsViewModel @Inject constructor(
         }
     }
 
+    fun resetSshMaxChannelsToAuto() {
+        viewModelScope.launch {
+            preferencesDataStore.resetSshMaxChannelsToAuto()
+        }
+    }
+
     // HTTP Proxy Settings
     fun setHttpProxyEnabled(enabled: Boolean) {
         viewModelScope.launch {
@@ -260,6 +332,38 @@ class SettingsViewModel @Inject constructor(
         viewModelScope.launch {
             val current = _uiState.value.domainRoutingDomains
             preferencesDataStore.setDomainRoutingDomains(current - domain)
+        }
+    }
+
+    // Geo-Bypass Settings
+    fun setGeoBypassEnabled(enabled: Boolean) {
+        viewModelScope.launch {
+            preferencesDataStore.setGeoBypassEnabled(enabled)
+        }
+    }
+
+    fun setGeoBypassCountry(country: GeoBypassCountry) {
+        viewModelScope.launch {
+            preferencesDataStore.setGeoBypassCountry(country.code)
+        }
+    }
+
+    // Remote DNS Settings
+    fun setRemoteDnsMode(mode: String) {
+        viewModelScope.launch {
+            preferencesDataStore.setRemoteDnsMode(mode)
+        }
+    }
+
+    fun setCustomRemoteDns(dns: String) {
+        viewModelScope.launch {
+            preferencesDataStore.setCustomRemoteDns(dns)
+        }
+    }
+
+    fun setCustomRemoteDnsFallback(dns: String) {
+        viewModelScope.launch {
+            preferencesDataStore.setCustomRemoteDnsFallback(dns)
         }
     }
 }

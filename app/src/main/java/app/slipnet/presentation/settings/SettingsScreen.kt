@@ -6,11 +6,15 @@ import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.WindowInsets
+import androidx.compose.foundation.layout.asPaddingValues
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.navigationBars
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
@@ -22,15 +26,20 @@ import androidx.compose.material.icons.filled.BugReport
 import androidx.compose.material.icons.filled.CallSplit
 import androidx.compose.material.icons.filled.Compress
 import androidx.compose.material.icons.filled.ContentCopy
+import androidx.compose.material.icons.filled.Remove
+import androidx.compose.material.icons.filled.Timer
 import androidx.compose.material.icons.filled.Lock
 import androidx.compose.material.icons.filled.DarkMode
 import androidx.compose.material.icons.filled.FilterList
+import androidx.compose.material.icons.filled.Help
 import androidx.compose.material.icons.filled.Hub
 import androidx.compose.material.icons.filled.PowerSettingsNew
+import androidx.compose.material.icons.filled.Shield
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Language
 import androidx.compose.material.icons.filled.Search
+import androidx.compose.material.icons.filled.Public
 import androidx.compose.material.icons.filled.TravelExplore
 import androidx.compose.material.icons.filled.SettingsEthernet
 import androidx.compose.material.icons.filled.Wifi
@@ -49,22 +58,27 @@ import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
+import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.hilt.navigation.compose.hiltViewModel
 import app.slipnet.data.local.datastore.DarkMode
 import app.slipnet.data.local.datastore.DomainRoutingMode
 import app.slipnet.data.local.datastore.SplitTunnelingMode
 import app.slipnet.data.local.datastore.SshCipher
+import app.slipnet.tunnel.GeoBypassCountry
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.text.KeyboardActions
@@ -76,6 +90,7 @@ import androidx.compose.material3.ExposedDropdownMenuBox
 import androidx.compose.material3.ExposedDropdownMenuDefaults
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.ui.platform.LocalClipboardManager
+import androidx.compose.ui.platform.LocalUriHandler
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.input.KeyboardType
 import java.net.Inet4Address
@@ -98,11 +113,25 @@ fun SettingsScreen(
     var showSplitModeDialog by remember { mutableStateOf(false) }
     var showDomainRoutingModeDialog by remember { mutableStateOf(false) }
     var showDomainManagementDialog by remember { mutableStateOf(false) }
+    var showGeoBypassCountryDialog by remember { mutableStateOf(false) }
+    var showAboutDialog by remember { mutableStateOf(false) }
+    var showRemoteDnsDialog by remember { mutableStateOf(false) }
 
     // Proxy settings - local state for port text fields to avoid cursor jumps from async DataStore round-trip
     var proxyPort by remember { mutableStateOf(uiState.proxyListenPort.toString()) }
     var httpProxyPort by remember { mutableStateOf(uiState.httpProxyPort.toString()) }
+
+    // Sync local state when DataStore values load (initial default → actual saved value)
+    LaunchedEffect(uiState.proxyListenPort) {
+        proxyPort = uiState.proxyListenPort.toString()
+    }
+    LaunchedEffect(uiState.httpProxyPort) {
+        httpProxyPort = uiState.httpProxyPort.toString()
+    }
+
     val addressOptions = getAddressOptions()
+
+    val navBarPadding = WindowInsets.navigationBars.asPaddingValues()
 
     Scaffold(
         topBar = {
@@ -112,16 +141,31 @@ fun SettingsScreen(
                     IconButton(onClick = onNavigateBack) {
                         Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back")
                     }
-                }
+                },
+                actions = {
+                    IconButton(onClick = { showAboutDialog = true }) {
+                        Icon(Icons.Default.Help, contentDescription = "About")
+                    }
+                },
+                colors = TopAppBarDefaults.topAppBarColors(
+                    containerColor = Color.Transparent
+                )
             )
-        }
+        },
+        containerColor = MaterialTheme.colorScheme.background,
+        contentWindowInsets = WindowInsets(0, 0, 0, 0)
     ) { paddingValues ->
         Column(
             modifier = Modifier
                 .fillMaxSize()
                 .padding(paddingValues)
                 .verticalScroll(scrollState)
-                .padding(horizontal = 16.dp, vertical = 12.dp),
+                .padding(
+                    start = 16.dp,
+                    end = 16.dp,
+                    top = 12.dp,
+                    bottom = 12.dp + navBarPadding.calculateBottomPadding()
+                ),
             verticalArrangement = Arrangement.spacedBy(20.dp)
         ) {
             // Connection Settings
@@ -142,6 +186,29 @@ fun SettingsScreen(
                     description = "Expose SOCKS5 proxy without creating VPN tunnel",
                     checked = uiState.proxyOnlyMode,
                     onCheckedChange = { viewModel.setProxyOnlyMode(it) }
+                )
+
+                SettingsDivider()
+
+                SwitchSettingItem(
+                    icon = Icons.Default.Shield,
+                    title = "Kill switch",
+                    description = "Block all traffic if VPN connection drops",
+                    checked = uiState.killSwitch,
+                    onCheckedChange = { viewModel.setKillSwitch(it) }
+                )
+
+                SettingsDivider()
+
+                StepperSettingItem(
+                    icon = Icons.Default.Timer,
+                    title = "Sleep timer",
+                    description = "Auto-disconnect after a set time",
+                    value = uiState.sleepTimerMinutes,
+                    step = 5,
+                    range = 0..120,
+                    valueFormatter = { if (it == 0) "Off" else "$it min" },
+                    onValueChange = { viewModel.setSleepTimerMinutes(it) }
                 )
             }
 
@@ -243,6 +310,25 @@ fun SettingsScreen(
                 )
             }
 
+            // DNS Settings
+            SettingsSection(
+                title = "DNS",
+                subtitle = "Changes apply on next connection"
+            ) {
+                ClickableSettingItem(
+                    icon = Icons.Default.Language,
+                    title = "Remote DNS server",
+                    description = if (uiState.remoteDnsMode == "custom") {
+                        val primary = uiState.customRemoteDns.ifBlank { "8.8.8.8" }
+                        val fallback = uiState.customRemoteDnsFallback.ifBlank { "1.1.1.1" }
+                        "Custom ($primary, $fallback)"
+                    } else {
+                        "Default (8.8.8.8, 1.1.1.1)"
+                    },
+                    onClick = { showRemoteDnsDialog = true }
+                )
+            }
+
             // Domain Routing Settings
             SettingsSection(
                 title = "Domain Routing",
@@ -276,6 +362,31 @@ fun SettingsScreen(
                         title = "Manage domains",
                         description = "${uiState.domainRoutingDomains.size} domains configured",
                         onClick = { showDomainManagementDialog = true }
+                    )
+                }
+            }
+
+            // Geo-Bypass Settings
+            SettingsSection(
+                title = "Geo-Bypass",
+                subtitle = "Changes apply on next connection"
+            ) {
+                SwitchSettingItem(
+                    icon = Icons.Default.Public,
+                    title = "Enable geo-bypass",
+                    description = "Route domestic traffic directly, bypass VPN for local sites",
+                    checked = uiState.geoBypassEnabled,
+                    onCheckedChange = { viewModel.setGeoBypassEnabled(it) }
+                )
+
+                if (uiState.geoBypassEnabled) {
+                    SettingsDivider()
+
+                    ClickableSettingItem(
+                        icon = Icons.Default.Language,
+                        title = "Country",
+                        description = uiState.geoBypassCountry.displayName,
+                        onClick = { showGeoBypassCountryDialog = true }
                     )
                 }
             }
@@ -349,11 +460,13 @@ fun SettingsScreen(
                 SliderSettingItem(
                     icon = Icons.Default.Hub,
                     title = "Max Channels",
+                    subtitle = if (!uiState.sshMaxChannelsIsCustom) "Auto (adapts per tunnel type)" else null,
                     value = uiState.sshMaxChannels,
                     valueRange = 4f..64f,
                     steps = 14,
                     valueFormatter = { "${it.roundToInt()}" },
-                    onValueChange = { viewModel.setSshMaxChannels(it.roundToInt()) }
+                    onValueChange = { viewModel.setSshMaxChannels(it.roundToInt()) },
+                    onReset = if (uiState.sshMaxChannelsIsCustom) {{ viewModel.resetSshMaxChannelsToAuto() }} else null
                 )
             }
 
@@ -560,6 +673,68 @@ fun SettingsScreen(
         )
     }
 
+    // Geo-Bypass Country Dialog
+    if (showGeoBypassCountryDialog) {
+        AlertDialog(
+            onDismissRequest = { showGeoBypassCountryDialog = false },
+            title = { Text("Select Country") },
+            text = {
+                Column {
+                    GeoBypassCountry.entries.forEach { country ->
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .clip(RoundedCornerShape(8.dp))
+                                .clickable {
+                                    viewModel.setGeoBypassCountry(country)
+                                    showGeoBypassCountryDialog = false
+                                }
+                                .padding(vertical = 12.dp, horizontal = 8.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            RadioButton(
+                                selected = uiState.geoBypassCountry == country,
+                                onClick = {
+                                    viewModel.setGeoBypassCountry(country)
+                                    showGeoBypassCountryDialog = false
+                                }
+                            )
+                            Text(
+                                text = country.displayName,
+                                modifier = Modifier.padding(start = 8.dp)
+                            )
+                        }
+                    }
+                }
+            },
+            confirmButton = {
+                TextButton(onClick = { showGeoBypassCountryDialog = false }) {
+                    Text("Cancel")
+                }
+            }
+        )
+    }
+
+    // Remote DNS Dialog
+    if (showRemoteDnsDialog) {
+        RemoteDnsDialog(
+            currentMode = uiState.remoteDnsMode,
+            currentCustomDns = uiState.customRemoteDns,
+            currentCustomDnsFallback = uiState.customRemoteDnsFallback,
+            onSelectDefault = {
+                viewModel.setRemoteDnsMode("default")
+                showRemoteDnsDialog = false
+            },
+            onSelectCustom = { dns, fallback ->
+                viewModel.setRemoteDnsMode("custom")
+                viewModel.setCustomRemoteDns(dns)
+                viewModel.setCustomRemoteDnsFallback(fallback)
+                showRemoteDnsDialog = false
+            },
+            onDismiss = { showRemoteDnsDialog = false }
+        )
+    }
+
     // SSH Cipher Dialog
     if (showSshCipherDialog) {
         AlertDialog(
@@ -597,6 +772,94 @@ fun SettingsScreen(
             confirmButton = {
                 TextButton(onClick = { showSshCipherDialog = false }) {
                     Text("Cancel")
+                }
+            }
+        )
+    }
+
+    // About Dialog
+    if (showAboutDialog) {
+        val clipboardManager = LocalClipboardManager.current
+        val uriHandler = LocalUriHandler.current
+        val donationAddress = "0xd4140058389572D50dC8716e768e687C050Dd5C9"
+
+        AlertDialog(
+            onDismissRequest = { showAboutDialog = false },
+            title = { Text("About SlipNet") },
+            text = {
+                Column(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalArrangement = Arrangement.spacedBy(12.dp)
+                ) {
+                    Text(
+                        text = "SlipNet VPN v${BuildConfig.VERSION_NAME}",
+                        style = MaterialTheme.typography.titleMedium
+                    )
+                    Text(
+                        text = "A free, source-available anti-censorship VPN tool designed to bypass internet restrictions. SlipNet tunnels your traffic through DNS, SSH, Tor, and other protocols to keep you connected when access is blocked.",
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+
+                    HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.5f))
+
+                    // GitHub
+                    Text(
+                        text = "GitHub",
+                        style = MaterialTheme.typography.labelLarge,
+                        color = MaterialTheme.colorScheme.primary
+                    )
+                    Text(
+                        text = "github.com/anonvector/SlipNet",
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = MaterialTheme.colorScheme.primary,
+                        modifier = Modifier.clickable {
+                            uriHandler.openUri("https://github.com/anonvector/SlipNet")
+                        }
+                    )
+
+                    HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.5f))
+
+                    // Donate
+                    Text(
+                        text = "Donate (USDT \u2013 BEP20 / ERC20)",
+                        style = MaterialTheme.typography.labelLarge,
+                        color = MaterialTheme.colorScheme.primary
+                    )
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Text(
+                            text = donationAddress,
+                            style = MaterialTheme.typography.bodySmall,
+                            modifier = Modifier.weight(1f),
+                            maxLines = 1,
+                            overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis
+                        )
+                        IconButton(
+                            onClick = {
+                                clipboardManager.setText(AnnotatedString(donationAddress))
+                            },
+                            modifier = Modifier.size(32.dp)
+                        ) {
+                            Icon(
+                                Icons.Default.ContentCopy,
+                                contentDescription = "Copy donation address",
+                                modifier = Modifier.size(18.dp)
+                            )
+                        }
+                    }
+                    Text(
+                        text = "Your support helps keep this project alive and free for everyone.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
+            },
+            confirmButton = {
+                TextButton(onClick = { showAboutDialog = false }) {
+                    Text("Close")
                 }
             }
         )
@@ -695,6 +958,121 @@ private fun DomainManagementDialog(
         confirmButton = {
             TextButton(onClick = { addDomain(); onDismiss() }) {
                 Text("Done")
+            }
+        }
+    )
+}
+
+@Composable
+private fun RemoteDnsDialog(
+    currentMode: String,
+    currentCustomDns: String,
+    currentCustomDnsFallback: String,
+    onSelectDefault: () -> Unit,
+    onSelectCustom: (String, String) -> Unit,
+    onDismiss: () -> Unit
+) {
+    var selectedMode by remember { mutableStateOf(currentMode) }
+    var customDns by remember { mutableStateOf(currentCustomDns) }
+    var customDnsFallback by remember { mutableStateOf(currentCustomDnsFallback) }
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("Remote DNS Server") },
+        text = {
+            Column {
+                Text(
+                    text = "DNS servers used on the remote side of the tunnel for resolving domain names.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.padding(bottom = 12.dp)
+                )
+
+                // Default option
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clip(RoundedCornerShape(8.dp))
+                        .clickable { selectedMode = "default" }
+                        .padding(vertical = 12.dp, horizontal = 8.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    RadioButton(
+                        selected = selectedMode == "default",
+                        onClick = { selectedMode = "default" }
+                    )
+                    Column(modifier = Modifier.padding(start = 8.dp)) {
+                        Text("Default (8.8.8.8, 1.1.1.1)")
+                        Text(
+                            text = "Google primary, Cloudflare fallback",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
+                }
+
+                // Custom option
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clip(RoundedCornerShape(8.dp))
+                        .clickable { selectedMode = "custom" }
+                        .padding(vertical = 12.dp, horizontal = 8.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    RadioButton(
+                        selected = selectedMode == "custom",
+                        onClick = { selectedMode = "custom" }
+                    )
+                    Text(
+                        text = "Custom",
+                        modifier = Modifier.padding(start = 8.dp)
+                    )
+                }
+
+                if (selectedMode == "custom") {
+                    OutlinedTextField(
+                        value = customDns,
+                        onValueChange = { customDns = it },
+                        placeholder = { Text("e.g., 9.9.9.9") },
+                        supportingText = { Text("Primary DNS server") },
+                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                        singleLine = true,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(start = 40.dp, top = 4.dp)
+                    )
+
+                    OutlinedTextField(
+                        value = customDnsFallback,
+                        onValueChange = { customDnsFallback = it },
+                        placeholder = { Text("e.g., 8.8.8.8") },
+                        supportingText = { Text("Fallback DNS server") },
+                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                        singleLine = true,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(start = 40.dp, top = 4.dp)
+                    )
+                }
+            }
+        },
+        confirmButton = {
+            TextButton(
+                onClick = {
+                    if (selectedMode == "default") {
+                        onSelectDefault()
+                    } else {
+                        onSelectCustom(customDns.trim(), customDnsFallback.trim())
+                    }
+                }
+            ) {
+                Text("OK")
+            }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss) {
+                Text("Cancel")
             }
         }
     )
@@ -836,11 +1214,13 @@ private fun ClickableSettingItem(
 private fun SliderSettingItem(
     icon: ImageVector,
     title: String,
+    subtitle: String? = null,
     value: Int,
     valueRange: ClosedFloatingPointRange<Float>,
     steps: Int,
     valueFormatter: (Float) -> String,
-    onValueChange: (Float) -> Unit
+    onValueChange: (Float) -> Unit,
+    onReset: (() -> Unit)? = null
 ) {
     Column(
         modifier = Modifier
@@ -857,13 +1237,28 @@ private fun SliderSettingItem(
                 tint = MaterialTheme.colorScheme.onSurfaceVariant,
                 modifier = Modifier.size(24.dp)
             )
-            Text(
-                text = title,
-                style = MaterialTheme.typography.bodyLarge,
+            Column(
                 modifier = Modifier
                     .weight(1f)
                     .padding(horizontal = 16.dp)
-            )
+            ) {
+                Text(
+                    text = title,
+                    style = MaterialTheme.typography.bodyLarge
+                )
+                if (subtitle != null) {
+                    Text(
+                        text = subtitle,
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
+            }
+            if (onReset != null) {
+                TextButton(onClick = onReset) {
+                    Text("Auto", style = MaterialTheme.typography.labelSmall)
+                }
+            }
             Text(
                 text = valueFormatter(value.toFloat()),
                 style = MaterialTheme.typography.labelLarge,
@@ -880,6 +1275,81 @@ private fun SliderSettingItem(
                 .fillMaxWidth()
                 .padding(start = 40.dp, top = 4.dp)
         )
+    }
+}
+
+@Composable
+private fun StepperSettingItem(
+    icon: ImageVector,
+    title: String,
+    description: String,
+    value: Int,
+    step: Int,
+    range: IntRange,
+    valueFormatter: (Int) -> String,
+    onValueChange: (Int) -> Unit
+) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(vertical = 8.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Icon(
+            imageVector = icon,
+            contentDescription = null,
+            tint = MaterialTheme.colorScheme.onSurfaceVariant,
+            modifier = Modifier.size(24.dp)
+        )
+        Column(
+            modifier = Modifier
+                .weight(1f)
+                .padding(horizontal = 16.dp)
+        ) {
+            Text(
+                text = title,
+                style = MaterialTheme.typography.bodyLarge
+            )
+            Spacer(modifier = Modifier.height(2.dp))
+            Text(
+                text = description,
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+        }
+        Row(
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            IconButton(
+                onClick = { onValueChange((value - step).coerceIn(range)) },
+                enabled = value > range.first,
+                modifier = Modifier.size(36.dp)
+            ) {
+                Icon(
+                    Icons.Default.Remove,
+                    contentDescription = "Decrease",
+                    modifier = Modifier.size(20.dp)
+                )
+            }
+            Text(
+                text = valueFormatter(value),
+                style = MaterialTheme.typography.labelLarge,
+                color = MaterialTheme.colorScheme.primary,
+                textAlign = TextAlign.Center,
+                modifier = Modifier.widthIn(min = 48.dp)
+            )
+            IconButton(
+                onClick = { onValueChange((value + step).coerceIn(range)) },
+                enabled = value < range.last,
+                modifier = Modifier.size(36.dp)
+            ) {
+                Icon(
+                    Icons.Default.Add,
+                    contentDescription = "Increase",
+                    modifier = Modifier.size(20.dp)
+                )
+            }
+        }
     }
 }
 

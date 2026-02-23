@@ -14,18 +14,22 @@ import android.net.VpnService
 import android.os.Build
 import android.os.ParcelFileDescriptor
 import android.os.PowerManager
-import android.util.Log
+import app.slipnet.util.AppLog as Log
 import app.slipnet.data.local.datastore.PreferencesDataStore
 import app.slipnet.data.local.datastore.SplitTunnelingMode
 import app.slipnet.data.local.datastore.SshCipher
 import app.slipnet.tunnel.DomainRouter
+import app.slipnet.tunnel.GeoBypassCountry
+import app.slipnet.tunnel.GeoBypassData
 import app.slipnet.data.repository.VpnRepositoryImpl
 import app.slipnet.domain.model.ConnectionState
 import app.slipnet.domain.model.TunnelType
 import app.slipnet.tunnel.DnsttBridge
+import app.slipnet.tunnel.DnsttSocksBridge
 import app.slipnet.tunnel.DohBridge
 import app.slipnet.tunnel.HevSocks5Tunnel
 import app.slipnet.tunnel.HttpProxyServer
+import app.slipnet.tunnel.NaiveBridge
 import app.slipnet.tunnel.SlipstreamBridge
 import app.slipnet.tunnel.SlipstreamSocksBridge
 import app.slipnet.tunnel.SnowflakeBridge
@@ -59,6 +63,7 @@ class SlipNetVpnService : VpnService() {
         private const val DEFAULT_DNS = "8.8.8.8"
         private const val HEALTH_CHECK_INTERVAL_MS = 5000L
         private const val STALE_TRAFFIC_THRESHOLD = 3 // Reconnect after 3 checks with no traffic
+        private const val QUIC_DOWN_THRESHOLD = 6 // Reconnect after 6 checks (30s) with QUIC down
 
         // Persistence keys for auto-restart
         private const val PREFS_NAME = "vpn_service_state"
@@ -95,12 +100,17 @@ class SlipNetVpnService : VpnService() {
     private var stateObserverJob: Job? = null
     @Volatile
     private var isReconnecting = false
+    @Volatile
+    private var isKillSwitchActive = false
     private var isProxyOnly = false
+    private var isUserInitiatedDisconnect = false
+    private var currentProfileName = ""
 
     // Traffic monitoring for stale connection detection
     private var lastTrafficRxBytes = 0L
     private var lastTrafficTxBytes = 0L
     private var staleTrafficChecks = 0
+    private var quicDownChecks = 0
 
     // Persistence and WakeLock for service resilience
     private lateinit var prefs: SharedPreferences
@@ -233,6 +243,19 @@ class SlipNetVpnService : VpnService() {
             // Wait for any in-progress disconnect to finish releasing ports
             disconnectJob?.join()
 
+            // Always stop previous proxies to ensure ports are freed.
+            // This handles the case where onDestroy() sent stop signals but
+            // didn't wait for native code to release ports (e.g. abandoned Rust threads).
+            withContext(Dispatchers.IO) {
+                try { stopCurrentProxy() } catch (_: Exception) {}
+            }
+
+            // Clean up previous connection resources if switching profiles
+            if (currentProfileId != -1L && currentProfileId != profileId) {
+                Log.i(TAG, "Switching profile: cleaning up previous connection")
+                cleanupConnection()
+            }
+
             val profile = connectionManager.getProfileById(profileId)
             if (profile == null) {
                 connectionManager.onVpnError("Profile not found")
@@ -241,10 +264,14 @@ class SlipNetVpnService : VpnService() {
             }
 
             currentProfileId = profileId
+            currentProfileName = profile.name
+            isUserInitiatedDisconnect = false
 
-            // Dismiss any previous reconnect notification
-            getSystemService(NotificationManager::class.java)
-                .cancel(NotificationHelper.RECONNECT_NOTIFICATION_ID)
+            // Dismiss any previous reconnect/disconnect notifications
+            getSystemService(NotificationManager::class.java).apply {
+                cancel(NotificationHelper.RECONNECT_NOTIFICATION_ID)
+                cancel(NotificationHelper.DISCONNECT_NOTIFICATION_ID)
+            }
 
             // Show connecting notification
             val notification = notificationHelper.createVpnNotification(ConnectionState.Connecting)
@@ -259,6 +286,7 @@ class SlipNetVpnService : VpnService() {
                 SshTunnelBridge.debugLogging = debug
                 DohBridge.debugLogging = debug
                 SlipstreamSocksBridge.debugLogging = debug
+                DnsttSocksBridge.debugLogging = debug
                 TorSocksBridge.debugLogging = debug
                 HttpProxyServer.debugLogging = debug
 
@@ -274,20 +302,30 @@ class SlipNetVpnService : VpnService() {
                 Log.i(TAG, "Starting VPN with tunnel type: $currentTunnelType")
 
                 val dnsServer = profile.resolvers.firstOrNull()?.host ?: DEFAULT_DNS
+                // Remote DNS: the DNS servers used on the remote side of the tunnel
+                val remoteDns = preferencesDataStore.getEffectiveRemoteDns().first()
+                val remoteDnsFallback = preferencesDataStore.getEffectiveRemoteDnsFallback().first()
+                Log.i(TAG, "Remote DNS: $remoteDns (fallback: $remoteDnsFallback)")
 
                 // The startup order differs between tunnel types:
                 // - Slipstream: Start proxy first (Rust uses protect_socket JNI callback)
                 // - DNSTT: Establish VPN first (uses addDisallowedApplication for socket protection)
                 when (currentTunnelType) {
-                    TunnelType.SLIPSTREAM -> connectSlipstream(profile, dnsServer)
-                    TunnelType.SLIPSTREAM_SSH -> connectSlipstreamSsh(profile, dnsServer)
-                    TunnelType.DNSTT -> connectDnstt(profile, dnsServer)
-                    TunnelType.SSH -> connectSsh(profile, dnsServer)
-                    TunnelType.DNSTT_SSH -> connectDnsttSsh(profile, dnsServer)
+                    TunnelType.SLIPSTREAM -> connectSlipstream(profile, dnsServer, remoteDns, remoteDnsFallback)
+                    TunnelType.SLIPSTREAM_SSH -> connectSlipstreamSsh(profile, dnsServer, remoteDns, remoteDnsFallback)
+                    TunnelType.DNSTT -> connectDnstt(profile, dnsServer, remoteDns, remoteDnsFallback)
+                    TunnelType.SSH -> connectSsh(profile, dnsServer, remoteDns, remoteDnsFallback)
+                    TunnelType.DNSTT_SSH -> connectDnsttSsh(profile, dnsServer, remoteDns, remoteDnsFallback)
                     TunnelType.DOH -> connectDoh(profile, dnsServer)
                     TunnelType.SNOWFLAKE -> connectSnowflake(profile, dnsServer)
+                    TunnelType.NAIVE_SSH -> connectNaiveSsh(profile, dnsServer, remoteDns, remoteDnsFallback)
                 }
 
+            } catch (e: kotlinx.coroutines.CancellationException) {
+                // Coroutine was cancelled (user disconnected, service stopped, or new connect).
+                // Do NOT treat as an error — let the cancelling code handle cleanup.
+                Log.d(TAG, "Connection coroutine cancelled")
+                throw e
             } catch (e: Exception) {
                 Log.e(TAG, "Exception during connection", e)
                 connectionManager.onVpnError(e.message ?: "Unknown error")
@@ -310,12 +348,13 @@ class SlipNetVpnService : VpnService() {
      *
      * addDisallowedApplication ensures the bridge's DatagramSockets bypass VPN.
      */
-    private suspend fun connectSlipstream(profile: app.slipnet.domain.model.ServerProfile, dnsServer: String) {
+    private suspend fun connectSlipstream(profile: app.slipnet.domain.model.ServerProfile, dnsServer: String, remoteDns: String, remoteDnsFallback: String) {
         val proxyPort = preferencesDataStore.proxyListenPort.first()
         val proxyHost = preferencesDataStore.proxyListenAddress.first()
         val slipstreamPort = proxyPort + 1
 
         // Step 1: Set VpnService reference for socket protection via JNI
+        SlipstreamBridge.proxyOnlyMode = isProxyOnly
         SlipstreamBridge.setVpnService(this@SlipNetVpnService)
 
         // Step 2: Start Slipstream proxy on internal port (127.0.0.1 only)
@@ -328,9 +367,15 @@ class SlipNetVpnService : VpnService() {
             return
         }
 
+        // Read actual port — may differ from requested if preferred port was stuck
+        val actualSlipstreamPort = SlipstreamBridge.getClientPort()
+        if (actualSlipstreamPort != slipstreamPort) {
+            Log.i(TAG, "Slipstream bound to alternative port $actualSlipstreamPort (preferred $slipstreamPort was stuck)")
+        }
+
         // Step 2.5: Verify proxy is listening
-        if (!waitForProxyReady(slipstreamPort, maxAttempts = 20, delayMs = 100)) {
-            handleProxyStartupFailure(slipstreamPort)
+        if (!waitForProxyReady(actualSlipstreamPort, maxAttempts = 20, delayMs = 100)) {
+            handleProxyStartupFailure(actualSlipstreamPort)
             return
         }
 
@@ -341,13 +386,17 @@ class SlipNetVpnService : VpnService() {
         }
 
         // Step 3: Start SlipstreamSocksBridge on proxyPort (user-facing, with auth for Dante)
+        // DNS target resolved at the REMOTE server (through Dante),
+        // not locally. Using local/ISP DNS would give poisoned results in censored networks.
         val bridgeResult = vpnRepository.startSlipstreamSocksBridge(
-            slipstreamPort = slipstreamPort,
+            slipstreamPort = actualSlipstreamPort,
             slipstreamHost = "127.0.0.1",
             bridgePort = proxyPort,
             bridgeHost = proxyHost,
             socksUsername = profile.socksUsername,
-            socksPassword = profile.socksPassword
+            socksPassword = profile.socksPassword,
+            dnsServer = remoteDns,
+            dnsFallback = remoteDnsFallback
         )
         if (bridgeResult.isFailure) {
             connectionManager.onVpnError(bridgeResult.exceptionOrNull()?.message ?: "Failed to start SOCKS5 bridge")
@@ -428,22 +477,60 @@ class SlipNetVpnService : VpnService() {
      * Build a DomainRouter from DataStore preferences.
      */
     private suspend fun buildDomainRouter(): DomainRouter {
-        val enabled = preferencesDataStore.domainRoutingEnabled.first()
-        if (!enabled) return DomainRouter.DISABLED
+        val domainRoutingEnabled = preferencesDataStore.domainRoutingEnabled.first()
+        val geoBypassEnabled = preferencesDataStore.geoBypassEnabled.first()
+
+        if (!domainRoutingEnabled && !geoBypassEnabled) return DomainRouter.DISABLED
+
         val mode = preferencesDataStore.domainRoutingMode.first()
-        val domains = preferencesDataStore.domainRoutingDomains.first()
-        Log.i(TAG, "Domain routing enabled: mode=$mode, ${domains.size} domains")
-        return DomainRouter(enabled = true, mode = mode, domains = domains)
+        val domains = if (domainRoutingEnabled) preferencesDataStore.domainRoutingDomains.first() else emptySet()
+
+        val geoData = if (geoBypassEnabled) {
+            val countryCode = preferencesDataStore.geoBypassCountry.first()
+            val country = GeoBypassCountry.fromCode(countryCode)
+            Log.i(TAG, "Geo-bypass enabled: country=${country.displayName}")
+            DomainRouter.loadGeoData(this, country)
+        } else {
+            GeoBypassData.EMPTY
+        }
+
+        if (domainRoutingEnabled) {
+            Log.i(TAG, "Domain routing enabled: mode=$mode, ${domains.size} domains")
+        }
+
+        return DomainRouter(
+            enabled = domainRoutingEnabled || geoBypassEnabled,
+            mode = mode,
+            domains = domains,
+            geoBypassEnabled = geoBypassEnabled,
+            geoBypass = geoData
+        )
     }
 
     /**
      * Read SSH tunnel settings from DataStore and apply to SshTunnelBridge.
      * Must be called before any SshTunnelBridge.start* method.
+     *
+     * If the user hasn't manually set Max Channels, uses a tunnel-type-aware default:
+     * - SSH-only: 32 (direct TCP, good bandwidth)
+     * - Slipstream+SSH: 24 (moderate throughput)
+     * - DNSTT+SSH: 12 (limited DNS throughput, too many channels choke the tunnel)
      */
     private suspend fun configureSshBridge() {
         val cipher = preferencesDataStore.sshCipher.first()
         val compression = preferencesDataStore.sshCompression.first()
-        val maxChannels = preferencesDataStore.sshMaxChannels.first()
+        val isCustom = preferencesDataStore.sshMaxChannelsIsCustom.first()
+        val maxChannels = if (isCustom) {
+            preferencesDataStore.sshMaxChannels.first()
+        } else {
+            when (currentTunnelType) {
+                TunnelType.SSH -> 32
+                TunnelType.NAIVE_SSH -> 32
+                TunnelType.SLIPSTREAM_SSH -> 24
+                TunnelType.DNSTT_SSH -> 12
+                else -> 16
+            }
+        }
         SshTunnelBridge.configure(
             cipher = cipher.jschConfig,
             compression = compression,
@@ -451,12 +538,13 @@ class SlipNetVpnService : VpnService() {
         )
     }
 
-    private suspend fun connectSlipstreamSsh(profile: app.slipnet.domain.model.ServerProfile, dnsServer: String) {
+    private suspend fun connectSlipstreamSsh(profile: app.slipnet.domain.model.ServerProfile, dnsServer: String, remoteDns: String, remoteDnsFallback: String) {
         val proxyPort = preferencesDataStore.proxyListenPort.first()
         val proxyHost = preferencesDataStore.proxyListenAddress.first()
         val slipstreamPort = proxyPort + 1
 
         // Step 1: Set VpnService reference for socket protection via JNI
+        SlipstreamBridge.proxyOnlyMode = isProxyOnly
         SlipstreamBridge.setVpnService(this@SlipNetVpnService)
 
         // Step 2: Start Slipstream tunnel on internal port (127.0.0.1 only)
@@ -469,9 +557,15 @@ class SlipNetVpnService : VpnService() {
             return
         }
 
+        // Read actual port — may differ from requested if preferred port was stuck
+        val actualSlipstreamPort = SlipstreamBridge.getClientPort()
+        if (actualSlipstreamPort != slipstreamPort) {
+            Log.i(TAG, "Slipstream bound to alternative port $actualSlipstreamPort (preferred $slipstreamPort was stuck)")
+        }
+
         // Step 2.5: Verify Slipstream is listening
-        if (!waitForProxyReady(slipstreamPort, maxAttempts = 20, delayMs = 100)) {
-            handleProxyStartupFailure(slipstreamPort)
+        if (!waitForProxyReady(actualSlipstreamPort, maxAttempts = 20, delayMs = 100)) {
+            handleProxyStartupFailure(actualSlipstreamPort)
             return
         }
 
@@ -499,21 +593,22 @@ class SlipNetVpnService : VpnService() {
         // Slipstream's local port, no SOCKS5 proxy wrapper needed.
         configureSshBridge()
         val sshResult = withContext(Dispatchers.IO) {
-            Log.i(TAG, "Starting SSH tunnel through Slipstream (${profile.sshHost}:${profile.sshPort} via 127.0.0.1:$slipstreamPort)")
+            Log.i(TAG, "Starting SSH tunnel through Slipstream (${profile.sshHost}:${profile.sshPort} via 127.0.0.1:$actualSlipstreamPort)")
             SshTunnelBridge.startOverProxy(
                 sshHost = profile.sshHost,
                 sshPort = profile.sshPort,
                 sshUsername = profile.sshUsername,
                 sshPassword = profile.sshPassword,
                 proxyHost = "127.0.0.1",
-                proxyPort = slipstreamPort,
+                proxyPort = actualSlipstreamPort,
                 listenPort = proxyPort,
                 listenHost = proxyHost,
                 blockDirectDns = true,  // No addDisallowedApplication — direct UDP would loop through VPN
-                useServerDns = profile.useServerDns,
                 sshAuthType = profile.sshAuthType,
                 sshPrivateKey = profile.sshPrivateKey,
-                sshKeyPassphrase = profile.sshKeyPassphrase
+                sshKeyPassphrase = profile.sshKeyPassphrase,
+                remoteDnsHost = remoteDns,
+                remoteDnsFallback = remoteDnsFallback
             )
         }
         if (sshResult.isFailure) {
@@ -585,51 +680,32 @@ class SlipNetVpnService : VpnService() {
      * is in effect when DNSTT creates its UDP sockets. This prevents a routing loop where
      * DNSTT's DNS queries would be captured by the VPN.
      */
-    private suspend fun connectDnstt(profile: app.slipnet.domain.model.ServerProfile, dnsServer: String) {
+    private suspend fun connectDnstt(profile: app.slipnet.domain.model.ServerProfile, dnsServer: String, remoteDns: String, remoteDnsFallback: String) {
         val proxyPort = preferencesDataStore.proxyListenPort.first()
         val proxyHost = preferencesDataStore.proxyListenAddress.first()
+        val dnsttPort = proxyPort + 1
 
         // Step 1: Set VpnService reference (for potential future use)
         DnsttBridge.setVpnService(this@SlipNetVpnService)
 
-        if (isProxyOnly) {
-            // Proxy-only: no VPN needed, start DNSTT directly (sockets go direct anyway)
-            val proxyResult = vpnRepository.startDnsttProxy(profile)
-            if (proxyResult.isFailure) {
-                connectionManager.onVpnError(proxyResult.exceptionOrNull()?.message ?: "Failed to start DNSTT proxy")
+        // Step 2: Establish VPN interface FIRST (with addDisallowedApplication for this app)
+        // This ensures DNSTT's sockets bypass the VPN when created
+        if (!isProxyOnly) {
+            vpnInterface = establishVpnInterface(dnsServer)
+            if (vpnInterface == null) {
+                connectionManager.onVpnError("Failed to establish VPN interface")
                 DnsttBridge.setVpnService(null)
                 stopForeground(STOP_FOREGROUND_REMOVE)
                 stopSelf()
                 return
             }
 
-            if (!waitForProxyReady(proxyPort, maxAttempts = 20, delayMs = 100)) {
-                handleProxyStartupFailure(proxyPort)
-                return
-            }
-
-            vpnRepository.setProxyConnected(profile)
-            Log.i(TAG, "Proxy-only mode: DNSTT SOCKS5 proxy ready on $proxyHost:$proxyPort")
-            finishConnection()
-            return
+            // Brief delay to let VPN routing settle (as reference app does)
+            delay(200)
         }
 
-        // Step 2: Establish VPN interface FIRST (with addDisallowedApplication for this app)
-        // This ensures DNSTT's sockets bypass the VPN when created
-        vpnInterface = establishVpnInterface(dnsServer)
-        if (vpnInterface == null) {
-            connectionManager.onVpnError("Failed to establish VPN interface")
-            DnsttBridge.setVpnService(null)
-            stopForeground(STOP_FOREGROUND_REMOVE)
-            stopSelf()
-            return
-        }
-
-        // Brief delay to let VPN routing settle (as reference app does)
-        delay(200)
-
-        // Step 3: Now start DNSTT proxy (its sockets will bypass VPN due to app exclusion)
-        val proxyResult = vpnRepository.startDnsttProxy(profile)
+        // Step 3: Start DNSTT on internal port (its sockets bypass VPN due to app exclusion)
+        val proxyResult = vpnRepository.startDnsttProxy(profile, portOverride = dnsttPort, hostOverride = "127.0.0.1")
         if (proxyResult.isFailure) {
             connectionManager.onVpnError(proxyResult.exceptionOrNull()?.message ?: "Failed to start DNSTT proxy")
             vpnInterface?.close()
@@ -640,15 +716,56 @@ class SlipNetVpnService : VpnService() {
             return
         }
 
-        // Step 3.5: Verify proxy is listening
-        if (!waitForProxyReady(proxyPort, maxAttempts = 20, delayMs = 100)) {
-            handleProxyStartupFailure(proxyPort)
+        // Step 3.5: Verify DNSTT is listening on internal port
+        if (!waitForProxyReady(dnsttPort, maxAttempts = 20, delayMs = 100)) {
+            handleProxyStartupFailure(dnsttPort)
             vpnInterface?.close()
             vpnInterface = null
             return
         }
 
-        // Step 4: Start tun2socks
+        // Step 4: Start DnsttSocksBridge on proxyPort (user-facing, with auth for Dante)
+        // DNS target resolved at the REMOTE server (through Dante),
+        // not locally. Using local/ISP DNS would give poisoned results in censored networks.
+        val bridgeResult = vpnRepository.startDnsttSocksBridge(
+            dnsttPort = dnsttPort,
+            dnsttHost = "127.0.0.1",
+            bridgePort = proxyPort,
+            bridgeHost = proxyHost,
+            socksUsername = profile.socksUsername,
+            socksPassword = profile.socksPassword,
+            dnsServer = remoteDns,
+            dnsFallback = remoteDnsFallback
+        )
+        if (bridgeResult.isFailure) {
+            connectionManager.onVpnError(bridgeResult.exceptionOrNull()?.message ?: "Failed to start DNSTT SOCKS5 bridge")
+            stopCurrentProxy()
+            DnsttBridge.setVpnService(null)
+            stopForeground(STOP_FOREGROUND_REMOVE)
+            stopSelf()
+            return
+        }
+
+        // Step 4.5: Verify bridge is listening
+        if (!waitForProxyReady(proxyPort, maxAttempts = 20, delayMs = 100)) {
+            Log.e(TAG, "DnsttSocksBridge failed to become ready on port $proxyPort")
+            connectionManager.onVpnError("DNSTT SOCKS5 bridge failed to start")
+            stopCurrentProxy()
+            DnsttBridge.setVpnService(null)
+            stopForeground(STOP_FOREGROUND_REMOVE)
+            stopSelf()
+            return
+        }
+
+        // Proxy-only mode: skip tun2socks
+        if (isProxyOnly) {
+            vpnRepository.setProxyConnected(profile)
+            Log.i(TAG, "Proxy-only mode: DNSTT SOCKS5 bridge ready on $proxyHost:$proxyPort")
+            finishConnection()
+            return
+        }
+
+        // Step 5: Start tun2socks pointing at bridge on proxyPort
         val tun2socksResult = vpnRepository.startTun2Socks(profile, vpnInterface!!)
         if (tun2socksResult.isFailure) {
             connectionManager.onVpnError(tun2socksResult.exceptionOrNull()?.message ?: "Failed to start tunnel")
@@ -662,7 +779,7 @@ class SlipNetVpnService : VpnService() {
 
         // Give DNSTT a moment to establish the connection
         delay(500)
-        Log.d(TAG, "DNSTT tunnel started")
+        Log.d(TAG, "DNSTT tunnel started with bridge")
 
         finishConnection()
     }
@@ -674,7 +791,7 @@ class SlipNetVpnService : VpnService() {
      * SSH connects directly to the remote server (no DNS tunneling).
      * DNS queries go direct via DatagramSocket (bypasses VPN via addDisallowedApplication).
      */
-    private suspend fun connectSsh(profile: app.slipnet.domain.model.ServerProfile, dnsServer: String) {
+    private suspend fun connectSsh(profile: app.slipnet.domain.model.ServerProfile, dnsServer: String, remoteDns: String, remoteDnsFallback: String) {
         val proxyPort = preferencesDataStore.proxyListenPort.first()
         val proxyHost = preferencesDataStore.proxyListenAddress.first()
 
@@ -691,10 +808,11 @@ class SlipNetVpnService : VpnService() {
                     listenPort = proxyPort,
                     listenHost = proxyHost,
                     forwardDnsThroughSsh = true,
-                    useServerDns = profile.useServerDns,
                     sshAuthType = profile.sshAuthType,
                     sshPrivateKey = profile.sshPrivateKey,
-                    sshKeyPassphrase = profile.sshKeyPassphrase
+                    sshKeyPassphrase = profile.sshKeyPassphrase,
+                    remoteDnsHost = remoteDns,
+                    remoteDnsFallback = remoteDnsFallback
                 )
             }
             if (sshResult.isFailure) {
@@ -744,10 +862,11 @@ class SlipNetVpnService : VpnService() {
                 listenPort = proxyPort,
                 listenHost = proxyHost,
                 forwardDnsThroughSsh = true,
-                useServerDns = profile.useServerDns,
                 sshAuthType = profile.sshAuthType,
                 sshPrivateKey = profile.sshPrivateKey,
-                sshKeyPassphrase = profile.sshKeyPassphrase
+                sshKeyPassphrase = profile.sshKeyPassphrase,
+                remoteDnsHost = remoteDns,
+                remoteDnsFallback = remoteDnsFallback
             )
         }
         if (sshResult.isFailure) {
@@ -788,6 +907,221 @@ class SlipNetVpnService : VpnService() {
     }
 
     /**
+     * Connect using NaiveProxy + SSH tunnel type.
+     * NaiveProxy provides a local SOCKS5 proxy that tunnels through Caddy's
+     * forwardproxy with authentic Chrome TLS fingerprinting. JSch connects
+     * through NaiveProxy's SOCKS5 to reach the SSH server.
+     *
+     * Traffic flow:
+     * App -> TUN -> hev-socks5-tunnel -> SshTunnelBridge SOCKS5 (proxyPort)
+     *   -> SSH direct-tcpip -> [JSch via ProxySOCKS5] -> NaiveProxy SOCKS5 (proxyPort+1)
+     *   -> Chrome TLS/HTTP2 CONNECT -> Caddy Server (forwardproxy) -> SSH:22
+     */
+    private suspend fun connectNaiveSsh(profile: app.slipnet.domain.model.ServerProfile, dnsServer: String, remoteDns: String, remoteDnsFallback: String) {
+        val proxyPort = preferencesDataStore.proxyListenPort.first()
+        val proxyHost = preferencesDataStore.proxyListenAddress.first()
+        val naivePort = proxyPort + 1
+
+        if (isProxyOnly) {
+            // Proxy-only: no VPN needed, start NaiveProxy + SSH directly
+            val naiveResult = withContext(Dispatchers.IO) {
+                NaiveBridge.start(
+                    context = this@SlipNetVpnService,
+                    listenPort = naivePort,
+                    listenHost = "127.0.0.1",
+                    serverHost = profile.domain,
+                    serverPort = profile.naivePort,
+                    username = profile.naiveUsername,
+                    password = profile.naivePassword,
+                )
+            }
+            if (naiveResult.isFailure) {
+                connectionManager.onVpnError(naiveResult.exceptionOrNull()?.message ?: "Failed to start NaiveProxy")
+                stopForeground(STOP_FOREGROUND_REMOVE)
+                stopSelf()
+                return
+            }
+
+            if (!waitForNaiveReady(maxAttempts = 30, delayMs = 200)) {
+                Log.e(TAG, "NaiveProxy failed to become ready on port $naivePort")
+                connectionManager.onVpnError("NaiveProxy failed to start")
+                NaiveBridge.stop()
+                stopForeground(STOP_FOREGROUND_REMOVE)
+                stopSelf()
+                return
+            }
+
+            // For NaiveProxy: use server domain instead of 127.0.0.1 as SSH target.
+            // NaiveProxy (Chromium) may bypass the HTTPS proxy for loopback addresses,
+            // causing SOCKS5 CONNECT to 127.0.0.1 to connect locally instead of remotely.
+            val naiveSshHost = if (profile.sshHost == "127.0.0.1" || profile.sshHost.isBlank()) {
+                profile.domain
+            } else {
+                profile.sshHost
+            }
+
+            configureSshBridge()
+            val sshResult = withContext(Dispatchers.IO) {
+                Log.i(TAG, "Starting SSH tunnel through NaiveProxy ($naiveSshHost:${profile.sshPort} via 127.0.0.1:$naivePort)")
+                SshTunnelBridge.startOverSocks5Proxy(
+                    sshHost = naiveSshHost,
+                    sshPort = profile.sshPort,
+                    sshUsername = profile.sshUsername,
+                    sshPassword = profile.sshPassword,
+                    proxyHost = "127.0.0.1",
+                    proxyPort = naivePort,
+                    socksUsername = null,
+                    socksPassword = null,
+                    listenPort = proxyPort,
+                    listenHost = proxyHost,
+                    sshAuthType = profile.sshAuthType,
+                    sshPrivateKey = profile.sshPrivateKey,
+                    sshKeyPassphrase = profile.sshKeyPassphrase,
+                    remoteDnsHost = remoteDns,
+                    remoteDnsFallback = remoteDnsFallback,
+                    naiveMode = true
+                )
+            }
+            if (sshResult.isFailure) {
+                connectionManager.onVpnError(sshResult.exceptionOrNull()?.message ?: "Failed to start SSH tunnel over NaiveProxy")
+                NaiveBridge.stop()
+                stopForeground(STOP_FOREGROUND_REMOVE)
+                stopSelf()
+                return
+            }
+
+            if (!waitForProxyReady(proxyPort, maxAttempts = 30, delayMs = 100)) {
+                Log.e(TAG, "SSH SOCKS5 proxy failed to become ready")
+                connectionManager.onVpnError("SSH tunnel failed to start over NaiveProxy")
+                SshTunnelBridge.stop()
+                NaiveBridge.stop()
+                stopForeground(STOP_FOREGROUND_REMOVE)
+                stopSelf()
+                return
+            }
+
+            vpnRepository.setProxyConnected(profile)
+            Log.i(TAG, "Proxy-only mode: NaiveProxy+SSH SOCKS5 proxy ready on $proxyHost:$proxyPort")
+            finishConnection()
+            return
+        }
+
+        // Step 1: Establish VPN interface with addDisallowedApplication
+        vpnInterface = establishVpnInterface(dnsServer)
+        if (vpnInterface == null) {
+            connectionManager.onVpnError("Failed to establish VPN interface")
+            stopForeground(STOP_FOREGROUND_REMOVE)
+            stopSelf()
+            return
+        }
+
+        delay(200)
+
+        // Step 2: Start NaiveProxy
+        val naiveResult = withContext(Dispatchers.IO) {
+            NaiveBridge.start(
+                context = this@SlipNetVpnService,
+                listenPort = naivePort,
+                listenHost = "127.0.0.1",
+                serverHost = profile.domain,
+                serverPort = profile.naivePort,
+                username = profile.naiveUsername,
+                password = profile.naivePassword
+            )
+        }
+        if (naiveResult.isFailure) {
+            connectionManager.onVpnError(naiveResult.exceptionOrNull()?.message ?: "Failed to start NaiveProxy")
+            vpnInterface?.close()
+            vpnInterface = null
+            stopForeground(STOP_FOREGROUND_REMOVE)
+            stopSelf()
+            return
+        }
+
+        // Wait for NaiveProxy ready (use isReady flag, not TCP connect, to avoid
+        // ERR_SOCKS_CONNECTION_FAILED noise from non-SOCKS5 probe)
+        if (!waitForNaiveReady(maxAttempts = 30, delayMs = 200)) {
+            Log.e(TAG, "NaiveProxy failed to become ready on port $naivePort")
+            connectionManager.onVpnError("NaiveProxy failed to start")
+            NaiveBridge.stop()
+            vpnInterface?.close()
+            vpnInterface = null
+            stopForeground(STOP_FOREGROUND_REMOVE)
+            stopSelf()
+            return
+        }
+
+        // Step 3: SSH over NaiveProxy's SOCKS5
+        // Use server domain instead of 127.0.0.1 to avoid Chromium loopback bypass
+        val naiveSshHost = if (profile.sshHost == "127.0.0.1" || profile.sshHost.isBlank()) {
+            profile.domain
+        } else {
+            profile.sshHost
+        }
+
+        configureSshBridge()
+        val sshResult = withContext(Dispatchers.IO) {
+            Log.i(TAG, "Starting SSH tunnel through NaiveProxy ($naiveSshHost:${profile.sshPort} via 127.0.0.1:$naivePort)")
+            SshTunnelBridge.startOverSocks5Proxy(
+                sshHost = naiveSshHost,
+                sshPort = profile.sshPort,
+                sshUsername = profile.sshUsername,
+                sshPassword = profile.sshPassword,
+                proxyHost = "127.0.0.1",
+                proxyPort = naivePort,
+                socksUsername = null,
+                socksPassword = null,
+                listenPort = proxyPort,
+                listenHost = proxyHost,
+                sshAuthType = profile.sshAuthType,
+                sshPrivateKey = profile.sshPrivateKey,
+                sshKeyPassphrase = profile.sshKeyPassphrase,
+                remoteDnsHost = remoteDns,
+                remoteDnsFallback = remoteDnsFallback,
+                naiveMode = true
+            )
+        }
+        if (sshResult.isFailure) {
+            connectionManager.onVpnError(sshResult.exceptionOrNull()?.message ?: "Failed to start SSH tunnel over NaiveProxy")
+            NaiveBridge.stop()
+            vpnInterface?.close()
+            vpnInterface = null
+            stopForeground(STOP_FOREGROUND_REMOVE)
+            stopSelf()
+            return
+        }
+
+        // Step 3.5: Wait for SSH SOCKS5 proxy to be ready
+        if (!waitForProxyReady(proxyPort, maxAttempts = 30, delayMs = 100)) {
+            Log.e(TAG, "SSH SOCKS5 proxy failed to become ready on port $proxyPort")
+            connectionManager.onVpnError("SSH tunnel failed to start over NaiveProxy")
+            SshTunnelBridge.stop()
+            NaiveBridge.stop()
+            vpnInterface?.close()
+            vpnInterface = null
+            stopForeground(STOP_FOREGROUND_REMOVE)
+            stopSelf()
+            return
+        }
+
+        // Step 4: Start tun2socks
+        val tun2socksResult = vpnRepository.startTun2Socks(profile, vpnInterface!!)
+        if (tun2socksResult.isFailure) {
+            connectionManager.onVpnError(tun2socksResult.exceptionOrNull()?.message ?: "Failed to start tunnel")
+            SshTunnelBridge.stop()
+            NaiveBridge.stop()
+            vpnInterface?.close()
+            vpnInterface = null
+            stopForeground(STOP_FOREGROUND_REMOVE)
+            stopSelf()
+            return
+        }
+
+        Log.d(TAG, "NaiveProxy+SSH tunnel started")
+        finishConnection()
+    }
+
+    /**
      * Connect using DNSTT+SSH tunnel type.
      * Order: Set DNSTT ref -> VPN interface (with app exclusion) -> Start DNSTT -> Wait for DNSTT ready
      *        -> Start SSH over DNSTT proxy -> Wait for SSH ready -> Start tun2socks on proxyPort
@@ -797,7 +1131,7 @@ class SlipNetVpnService : VpnService() {
      *   -> SSH direct-tcpip -> DNSTT (proxyPort+1, 127.0.0.1, raw TCP tunnel)
      *   -> DNS tunnel (UDP 53) -> DNSTT Server -> SSH Server -> Internet
      */
-    private suspend fun connectDnsttSsh(profile: app.slipnet.domain.model.ServerProfile, dnsServer: String) {
+    private suspend fun connectDnsttSsh(profile: app.slipnet.domain.model.ServerProfile, dnsServer: String, remoteDns: String, remoteDnsFallback: String) {
         val proxyPort = preferencesDataStore.proxyListenPort.first()
         val proxyHost = preferencesDataStore.proxyListenAddress.first()
         val dnsttPort = proxyPort + 1
@@ -859,10 +1193,11 @@ class SlipNetVpnService : VpnService() {
                 listenPort = proxyPort,
                 listenHost = proxyHost,
                 blockDirectDns = true,
-                useServerDns = profile.useServerDns,
                 sshAuthType = profile.sshAuthType,
                 sshPrivateKey = profile.sshPrivateKey,
-                sshKeyPassphrase = profile.sshKeyPassphrase
+                sshKeyPassphrase = profile.sshKeyPassphrase,
+                remoteDnsHost = remoteDns,
+                remoteDnsFallback = remoteDnsFallback
             )
         }
         if (sshResult.isFailure) {
@@ -1231,6 +1566,7 @@ class SlipNetVpnService : VpnService() {
             TunnelType.SSH -> SshTunnelBridge.isRunning()
             TunnelType.DNSTT_SSH -> try { DnsttBridge.isRunning() } catch (e: Exception) { false }
             TunnelType.DOH -> DohBridge.isRunning()
+            TunnelType.NAIVE_SSH -> NaiveBridge.isRunning()
             TunnelType.SNOWFLAKE -> SnowflakeBridge.isRunning()
         }
         Log.e(TAG, "Proxy failed to become ready on port $port, nativeRunning=$nativeRunning")
@@ -1376,6 +1712,7 @@ class SlipNetVpnService : VpnService() {
                         true
                     }
                     TunnelType.DOH -> DohBridge.isRunning()
+                    TunnelType.NAIVE_SSH -> NaiveBridge.isRunning()
                     TunnelType.SNOWFLAKE -> SnowflakeBridge.isRunning()
                 }
 
@@ -1413,6 +1750,33 @@ class SlipNetVpnService : VpnService() {
     }
 
     /**
+     * Wait for NaiveProxy to report readiness via its "Listening on" log line.
+     * Unlike waitForProxyReady (which opens a TCP connection), this checks the
+     * NaiveBridge.isReady flag set by the output reader thread. This avoids
+     * sending a non-SOCKS5 probe that causes ERR_SOCKS_CONNECTION_FAILED noise.
+     */
+    private suspend fun waitForNaiveReady(maxAttempts: Int = 30, delayMs: Long = 200): Boolean {
+        Log.d(TAG, "Waiting for NaiveProxy to become ready (max ${maxAttempts * delayMs}ms)")
+        return kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+            repeat(maxAttempts) { attempt ->
+                if (!NaiveBridge.isRunning()) {
+                    Log.e(TAG, "NaiveProxy process died during startup (attempt ${attempt + 1})")
+                    return@withContext false
+                }
+                if (NaiveBridge.isReady) {
+                    Log.i(TAG, "NaiveProxy ready after ${attempt + 1} attempts (${(attempt + 1) * delayMs}ms)")
+                    return@withContext true
+                }
+                if (attempt < maxAttempts - 1) {
+                    Thread.sleep(delayMs)
+                }
+            }
+            Log.e(TAG, "NaiveProxy failed to become ready after $maxAttempts attempts")
+            false
+        }
+    }
+
+    /**
      * Start periodic health check to detect if the Rust client has crashed
      * or if the connection has become stale.
      */
@@ -1422,6 +1786,7 @@ class SlipNetVpnService : VpnService() {
         lastTrafficRxBytes = 0L
         lastTrafficTxBytes = 0L
         staleTrafficChecks = 0
+        quicDownChecks = 0
 
         healthCheckJob = serviceScope.launch(Dispatchers.IO) {
             // Give the connection time to establish before monitoring
@@ -1440,12 +1805,33 @@ class SlipNetVpnService : VpnService() {
                 if (!proxyHealthy || !tunnelRunning) {
                     Log.e(TAG, "Health check failed: proxy=$proxyHealthy (type=$currentTunnelType), tunnel=$tunnelRunning")
                     launch(Dispatchers.Main) {
-                        connectionManager.onVpnError("VPN connection lost - native client stopped unexpectedly")
-                        cleanupConnection()
-                        stopForeground(STOP_FOREGROUND_REMOVE)
-                        stopSelf()
+                        handleTunnelFailure("health check failed")
                     }
                     break
+                }
+
+                // For Slipstream types: check if QUIC connection is alive.
+                // The Rust client auto-reconnects when QUIC drops, but if it's been
+                // down too long (e.g. Samsung BBA blocked UDP in background), trigger
+                // a full reconnect to also reset the DNS worker pool.
+                if (currentTunnelType == TunnelType.SLIPSTREAM || currentTunnelType == TunnelType.SLIPSTREAM_SSH) {
+                    if (SlipstreamBridge.isQuicReady()) {
+                        if (quicDownChecks > 0) {
+                            Log.i(TAG, "QUIC connection recovered after $quicDownChecks checks")
+                        }
+                        quicDownChecks = 0
+                    } else {
+                        quicDownChecks++
+                        Log.w(TAG, "QUIC not ready ($quicDownChecks/${QUIC_DOWN_THRESHOLD})")
+                        if (quicDownChecks >= QUIC_DOWN_THRESHOLD) {
+                            Log.e(TAG, "QUIC connection dead for ${quicDownChecks * HEALTH_CHECK_INTERVAL_MS}ms, triggering reconnect")
+                            quicDownChecks = 0
+                            launch(Dispatchers.Main) {
+                                handleTunnelFailure("QUIC connection lost")
+                            }
+                            break
+                        }
+                    }
                 }
 
                 // Check traffic stats for stale connection detection (skip in proxy-only mode)
@@ -1635,6 +2021,8 @@ class SlipNetVpnService : VpnService() {
 
                 val proxyPort = preferencesDataStore.proxyListenPort.first()
                 val proxyHost = preferencesDataStore.proxyListenAddress.first()
+                val remoteDns = preferencesDataStore.getEffectiveRemoteDns().first()
+                val remoteDnsFallback = preferencesDataStore.getEffectiveRemoteDnsFallback().first()
 
                 // Restart the appropriate proxy
                 if (currentTunnelType == TunnelType.SSH) {
@@ -1649,28 +2037,23 @@ class SlipNetVpnService : VpnService() {
                             listenPort = proxyPort,
                             listenHost = proxyHost,
                             forwardDnsThroughSsh = true,
-                            useServerDns = profile.useServerDns,
                             sshAuthType = profile.sshAuthType,
                             sshPrivateKey = profile.sshPrivateKey,
-                            sshKeyPassphrase = profile.sshKeyPassphrase
+                            sshKeyPassphrase = profile.sshKeyPassphrase,
+                            remoteDnsHost = remoteDns,
+                            remoteDnsFallback = remoteDnsFallback
                         )
                     }
                     if (sshResult.isFailure) {
                         Log.e(TAG, "Failed to restart SSH tunnel after network change", sshResult.exceptionOrNull())
-                        connectionManager.onVpnError("Failed to reconnect SSH after network change")
-                        cleanupConnection()
-                        stopForeground(STOP_FOREGROUND_REMOVE)
-                        stopSelf()
+                        handleTunnelFailure("failed to reconnect SSH after network change")
                         return@launch
                     }
 
                     // Wait for SSH SOCKS5 proxy to be ready
                     if (!waitForProxyReady(proxyPort, maxAttempts = 30, delayMs = 50)) {
                         Log.e(TAG, "SSH SOCKS5 proxy failed to restart")
-                        connectionManager.onVpnError("Failed to reconnect SSH after network change")
-                        cleanupConnection()
-                        stopForeground(STOP_FOREGROUND_REMOVE)
-                        stopSelf()
+                        handleTunnelFailure("failed to reconnect SSH after network change")
                         return@launch
                     }
                 } else if (currentTunnelType == TunnelType.DNSTT_SSH) {
@@ -1680,19 +2063,13 @@ class SlipNetVpnService : VpnService() {
                     val dnsttResult = vpnRepository.startDnsttProxy(profile, portOverride = dnsttPort, hostOverride = "127.0.0.1")
                     if (dnsttResult.isFailure) {
                         Log.e(TAG, "Failed to restart DNSTT after network change", dnsttResult.exceptionOrNull())
-                        connectionManager.onVpnError("Failed to reconnect DNSTT+SSH after network change")
-                        cleanupConnection()
-                        stopForeground(STOP_FOREGROUND_REMOVE)
-                        stopSelf()
+                        handleTunnelFailure("failed to reconnect DNSTT+SSH after network change")
                         return@launch
                     }
 
                     if (!waitForProxyReady(dnsttPort, maxAttempts = 20, delayMs = 50)) {
                         Log.e(TAG, "DNSTT proxy failed to restart")
-                        connectionManager.onVpnError("Failed to reconnect DNSTT+SSH after network change")
-                        cleanupConnection()
-                        stopForeground(STOP_FOREGROUND_REMOVE)
-                        stopSelf()
+                        handleTunnelFailure("failed to reconnect DNSTT+SSH after network change")
                         return@launch
                     }
 
@@ -1711,27 +2088,22 @@ class SlipNetVpnService : VpnService() {
                             listenPort = proxyPort,
                             listenHost = proxyHost,
                             blockDirectDns = true,
-                            useServerDns = profile.useServerDns,
                             sshAuthType = profile.sshAuthType,
                             sshPrivateKey = profile.sshPrivateKey,
-                            sshKeyPassphrase = profile.sshKeyPassphrase
+                            sshKeyPassphrase = profile.sshKeyPassphrase,
+                            remoteDnsHost = remoteDns,
+                            remoteDnsFallback = remoteDnsFallback
                         )
                     }
                     if (sshResult.isFailure) {
                         Log.e(TAG, "Failed to restart SSH over DNSTT after network change", sshResult.exceptionOrNull())
-                        connectionManager.onVpnError("Failed to reconnect DNSTT+SSH after network change")
-                        cleanupConnection()
-                        stopForeground(STOP_FOREGROUND_REMOVE)
-                        stopSelf()
+                        handleTunnelFailure("failed to reconnect DNSTT+SSH after network change")
                         return@launch
                     }
 
                     if (!waitForProxyReady(proxyPort, maxAttempts = 30, delayMs = 50)) {
                         Log.e(TAG, "SSH SOCKS5 proxy failed to restart on port $proxyPort")
-                        connectionManager.onVpnError("Failed to reconnect DNSTT+SSH after network change")
-                        cleanupConnection()
-                        stopForeground(STOP_FOREGROUND_REMOVE)
-                        stopSelf()
+                        handleTunnelFailure("failed to reconnect DNSTT+SSH after network change")
                         return@launch
                     }
                 } else if (currentTunnelType == TunnelType.SLIPSTREAM_SSH) {
@@ -1741,19 +2113,15 @@ class SlipNetVpnService : VpnService() {
                     val slipResult = vpnRepository.startSlipstreamProxy(profile, portOverride = slipstreamPort, hostOverride = "127.0.0.1")
                     if (slipResult.isFailure) {
                         Log.e(TAG, "Failed to restart Slipstream after network change", slipResult.exceptionOrNull())
-                        connectionManager.onVpnError("Failed to reconnect Slipstream+SSH after network change")
-                        cleanupConnection()
-                        stopForeground(STOP_FOREGROUND_REMOVE)
-                        stopSelf()
+                        handleTunnelFailure("failed to reconnect Slipstream+SSH after network change")
                         return@launch
                     }
 
-                    if (!waitForProxyReady(slipstreamPort, maxAttempts = 20, delayMs = 50)) {
+                    val actualSlipstreamPort = SlipstreamBridge.getClientPort()
+
+                    if (!waitForProxyReady(actualSlipstreamPort, maxAttempts = 20, delayMs = 50)) {
                         Log.e(TAG, "Slipstream proxy failed to restart")
-                        connectionManager.onVpnError("Failed to reconnect Slipstream+SSH after network change")
-                        cleanupConnection()
-                        stopForeground(STOP_FOREGROUND_REMOVE)
-                        stopSelf()
+                        handleTunnelFailure("failed to reconnect Slipstream+SSH after network change")
                         return@launch
                     }
 
@@ -1772,31 +2140,26 @@ class SlipNetVpnService : VpnService() {
                             sshUsername = profile.sshUsername,
                             sshPassword = profile.sshPassword,
                             proxyHost = "127.0.0.1",
-                            proxyPort = slipstreamPort,
+                            proxyPort = actualSlipstreamPort,
                             listenPort = proxyPort,
                             listenHost = proxyHost,
                             blockDirectDns = true,
-                            useServerDns = profile.useServerDns,
                             sshAuthType = profile.sshAuthType,
                             sshPrivateKey = profile.sshPrivateKey,
-                            sshKeyPassphrase = profile.sshKeyPassphrase
+                            sshKeyPassphrase = profile.sshKeyPassphrase,
+                            remoteDnsHost = remoteDns,
+                            remoteDnsFallback = remoteDnsFallback
                         )
                     }
                     if (sshResult.isFailure) {
                         Log.e(TAG, "Failed to restart SSH over Slipstream after network change", sshResult.exceptionOrNull())
-                        connectionManager.onVpnError("Failed to reconnect Slipstream+SSH after network change")
-                        cleanupConnection()
-                        stopForeground(STOP_FOREGROUND_REMOVE)
-                        stopSelf()
+                        handleTunnelFailure("failed to reconnect Slipstream+SSH after network change")
                         return@launch
                     }
 
                     if (!waitForProxyReady(proxyPort, maxAttempts = 30, delayMs = 50)) {
                         Log.e(TAG, "SSH SOCKS5 proxy failed to restart on port $proxyPort")
-                        connectionManager.onVpnError("Failed to reconnect Slipstream+SSH after network change")
-                        cleanupConnection()
-                        stopForeground(STOP_FOREGROUND_REMOVE)
-                        stopSelf()
+                        handleTunnelFailure("failed to reconnect Slipstream+SSH after network change")
                         return@launch
                     }
                 } else if (currentTunnelType == TunnelType.SLIPSTREAM) {
@@ -1806,19 +2169,15 @@ class SlipNetVpnService : VpnService() {
                     val slipResult = vpnRepository.startSlipstreamProxy(profile, portOverride = slipstreamPort, hostOverride = "127.0.0.1")
                     if (slipResult.isFailure) {
                         Log.e(TAG, "Failed to restart Slipstream after network change", slipResult.exceptionOrNull())
-                        connectionManager.onVpnError("Failed to reconnect Slipstream after network change")
-                        cleanupConnection()
-                        stopForeground(STOP_FOREGROUND_REMOVE)
-                        stopSelf()
+                        handleTunnelFailure("failed to reconnect Slipstream after network change")
                         return@launch
                     }
 
-                    if (!waitForProxyReady(slipstreamPort, maxAttempts = 20, delayMs = 50)) {
+                    val actualSlipstreamPort = SlipstreamBridge.getClientPort()
+
+                    if (!waitForProxyReady(actualSlipstreamPort, maxAttempts = 20, delayMs = 50)) {
                         Log.e(TAG, "Slipstream proxy failed to restart")
-                        connectionManager.onVpnError("Failed to reconnect Slipstream after network change")
-                        cleanupConnection()
-                        stopForeground(STOP_FOREGROUND_REMOVE)
-                        stopSelf()
+                        handleTunnelFailure("failed to reconnect Slipstream after network change")
                         return@launch
                     }
 
@@ -1829,7 +2188,7 @@ class SlipNetVpnService : VpnService() {
 
                     // Restart bridge on proxyPort (with auth for Dante)
                     val bridgeResult = vpnRepository.startSlipstreamSocksBridge(
-                        slipstreamPort = slipstreamPort,
+                        slipstreamPort = actualSlipstreamPort,
                         slipstreamHost = "127.0.0.1",
                         bridgePort = proxyPort,
                         bridgeHost = proxyHost,
@@ -1838,24 +2197,119 @@ class SlipNetVpnService : VpnService() {
                     )
                     if (bridgeResult.isFailure) {
                         Log.e(TAG, "Failed to restart bridge after network change")
-                        connectionManager.onVpnError("Failed to reconnect after network change")
-                        cleanupConnection()
-                        stopForeground(STOP_FOREGROUND_REMOVE)
-                        stopSelf()
+                        handleTunnelFailure("failed to reconnect after network change")
                         return@launch
                     }
 
                     if (!waitForProxyReady(proxyPort, maxAttempts = 20, delayMs = 50)) {
                         Log.e(TAG, "Bridge failed to restart on port $proxyPort")
-                        connectionManager.onVpnError("Failed to reconnect after network change")
-                        cleanupConnection()
-                        stopForeground(STOP_FOREGROUND_REMOVE)
-                        stopSelf()
+                        handleTunnelFailure("failed to reconnect after network change")
+                        return@launch
+                    }
+                } else if (currentTunnelType == TunnelType.DNSTT) {
+                    // DNSTT: restart tunnel on internal port + bridge on proxyPort
+                    val dnsttPort = proxyPort + 1
+
+                    val dnsttResult = vpnRepository.startDnsttProxy(profile, portOverride = dnsttPort, hostOverride = "127.0.0.1")
+                    if (dnsttResult.isFailure) {
+                        Log.e(TAG, "Failed to restart DNSTT after network change", dnsttResult.exceptionOrNull())
+                        handleTunnelFailure("failed to reconnect DNSTT after network change")
+                        return@launch
+                    }
+
+                    if (!waitForProxyReady(dnsttPort, maxAttempts = 20, delayMs = 50)) {
+                        Log.e(TAG, "DNSTT proxy failed to restart on port $dnsttPort")
+                        handleTunnelFailure("failed to reconnect DNSTT after network change")
+                        return@launch
+                    }
+
+                    // Restart bridge on proxyPort (with auth for Dante)
+                    val bridgeResult = vpnRepository.startDnsttSocksBridge(
+                        dnsttPort = dnsttPort,
+                        dnsttHost = "127.0.0.1",
+                        bridgePort = proxyPort,
+                        bridgeHost = proxyHost,
+                        socksUsername = profile.socksUsername,
+                        socksPassword = profile.socksPassword
+                    )
+                    if (bridgeResult.isFailure) {
+                        Log.e(TAG, "Failed to restart DNSTT bridge after network change")
+                        handleTunnelFailure("failed to reconnect DNSTT after network change")
+                        return@launch
+                    }
+
+                    if (!waitForProxyReady(proxyPort, maxAttempts = 20, delayMs = 50)) {
+                        Log.e(TAG, "DNSTT bridge failed to restart on port $proxyPort")
+                        handleTunnelFailure("failed to reconnect DNSTT after network change")
+                        return@launch
+                    }
+                } else if (currentTunnelType == TunnelType.NAIVE_SSH) {
+                    // NaiveProxy+SSH: restart NaiveProxy on internal port, then SSH on proxyPort
+                    val naivePort = proxyPort + 1
+
+                    val naiveResult = withContext(Dispatchers.IO) {
+                        NaiveBridge.start(
+                            context = this@SlipNetVpnService,
+                            listenPort = naivePort,
+                            listenHost = "127.0.0.1",
+                            serverHost = profile.domain,
+                            serverPort = profile.naivePort,
+                            username = profile.naiveUsername,
+                            password = profile.naivePassword,
+                                )
+                    }
+                    if (naiveResult.isFailure) {
+                        Log.e(TAG, "Failed to restart NaiveProxy after network change", naiveResult.exceptionOrNull())
+                        handleTunnelFailure("failed to reconnect NaiveProxy+SSH after network change")
+                        return@launch
+                    }
+
+                    if (!waitForNaiveReady(maxAttempts = 30, delayMs = 200)) {
+                        Log.e(TAG, "NaiveProxy failed to become ready after network change")
+                        handleTunnelFailure("failed to reconnect NaiveProxy+SSH after network change")
+                        return@launch
+                    }
+
+                    val naiveSshHost = if (profile.sshHost == "127.0.0.1" || profile.sshHost.isBlank()) {
+                        profile.domain
+                    } else {
+                        profile.sshHost
+                    }
+
+                    configureSshBridge()
+                    val sshResult = withContext(Dispatchers.IO) {
+                        SshTunnelBridge.startOverSocks5Proxy(
+                            sshHost = naiveSshHost,
+                            sshPort = profile.sshPort,
+                            sshUsername = profile.sshUsername,
+                            sshPassword = profile.sshPassword,
+                            proxyHost = "127.0.0.1",
+                            proxyPort = naivePort,
+                            socksUsername = null,
+                            socksPassword = null,
+                            listenPort = proxyPort,
+                            listenHost = proxyHost,
+                            sshAuthType = profile.sshAuthType,
+                            sshPrivateKey = profile.sshPrivateKey,
+                            sshKeyPassphrase = profile.sshKeyPassphrase,
+                            remoteDnsHost = remoteDns,
+                            remoteDnsFallback = remoteDnsFallback,
+                            naiveMode = true
+                        )
+                    }
+                    if (sshResult.isFailure) {
+                        Log.e(TAG, "Failed to restart SSH over NaiveProxy after network change", sshResult.exceptionOrNull())
+                        handleTunnelFailure("failed to reconnect NaiveProxy+SSH after network change")
+                        return@launch
+                    }
+
+                    if (!waitForProxyReady(proxyPort, maxAttempts = 30, delayMs = 50)) {
+                        Log.e(TAG, "SSH SOCKS5 proxy failed to restart on port $proxyPort")
+                        handleTunnelFailure("failed to reconnect NaiveProxy+SSH after network change")
                         return@launch
                     }
                 } else {
                     val proxyResult = when (currentTunnelType) {
-                        TunnelType.DNSTT -> vpnRepository.startDnsttProxy(profile)
                         TunnelType.DOH -> vpnRepository.startDohProxy(profile)
                         TunnelType.SNOWFLAKE -> {
                             val torSocksPort = proxyPort + 1
@@ -1866,20 +2320,14 @@ class SlipNetVpnService : VpnService() {
                     }
                     if (proxyResult.isFailure) {
                         Log.e(TAG, "Failed to restart proxy after network change", proxyResult.exceptionOrNull())
-                        connectionManager.onVpnError("Failed to reconnect after network change")
-                        cleanupConnection()
-                        stopForeground(STOP_FOREGROUND_REMOVE)
-                        stopSelf()
+                        handleTunnelFailure("failed to reconnect after network change")
                         return@launch
                     }
 
                     // Wait for proxy to be ready
                     if (!waitForProxyReady(proxyPort, maxAttempts = 20, delayMs = 50)) {
                         Log.e(TAG, "Proxy failed to restart")
-                        connectionManager.onVpnError("Failed to reconnect after network change")
-                        cleanupConnection()
-                        stopForeground(STOP_FOREGROUND_REMOVE)
-                        stopSelf()
+                        handleTunnelFailure("failed to reconnect after network change")
                         return@launch
                     }
                 }
@@ -1894,10 +2342,7 @@ class SlipNetVpnService : VpnService() {
                         val tun2socksResult = vpnRepository.startTun2Socks(profile, pfd)
                         if (tun2socksResult.isFailure) {
                             Log.e(TAG, "Failed to restart tun2socks", tun2socksResult.exceptionOrNull())
-                            connectionManager.onVpnError("Failed to reconnect after network change")
-                            cleanupConnection()
-                            stopForeground(STOP_FOREGROUND_REMOVE)
-                            stopSelf()
+                            handleTunnelFailure("failed to reconnect after network change")
                             return@launch
                         }
                     }
@@ -1914,19 +2359,51 @@ class SlipNetVpnService : VpnService() {
                     // Wait for Tor to re-bootstrap after network change
                     if (!waitForTorReady(maxWaitMs = 90000)) {
                         Log.e(TAG, "Tor failed to re-bootstrap after network change")
-                        connectionManager.onVpnError("Tor failed to reconnect after network change")
-                        cleanupConnection()
-                        stopForeground(STOP_FOREGROUND_REMOVE)
-                        stopSelf()
+                        handleTunnelFailure("Tor failed to reconnect after network change")
                         return@launch
                     }
+                } else if (currentTunnelType == TunnelType.NAIVE_SSH) {
+                    delay(500)
                 } else {
                     // For DNSTT/DNSTT+SSH, give it a moment to re-establish
                     delay(500)
                 }
 
+                // Restart HTTP proxy if it was running before (stopped by stopCurrentProxy)
+                if (!HttpProxyServer.isRunning()) {
+                    val appendProxy = preferencesDataStore.appendHttpProxyToVpn.first()
+                    val httpEnabled = preferencesDataStore.httpProxyEnabled.first()
+                    if (appendProxy || httpEnabled) {
+                        val httpPort = preferencesDataStore.httpProxyPort.first()
+                        val socksPort = preferencesDataStore.proxyListenPort.first()
+                        // Append mode uses 127.0.0.1; hotspot mode uses proxyListenAddress
+                        val socksHost = if (appendProxy) "127.0.0.1" else preferencesDataStore.proxyListenAddress.first()
+                        val listenHost = if (appendProxy) "127.0.0.1" else socksHost
+                        val result = HttpProxyServer.start(
+                            socksHost = socksHost,
+                            socksPort = socksPort,
+                            listenHost = listenHost,
+                            listenPort = httpPort
+                        )
+                        if (result.isFailure) {
+                            Log.w(TAG, "HTTP proxy failed to restart after reconnect: ${result.exceptionOrNull()?.message}")
+                        } else {
+                            Log.i(TAG, "HTTP proxy restarted on $listenHost:$httpPort after reconnect")
+                        }
+                    }
+                }
+
                 // Restart health check
                 startHealthCheck()
+
+                // Clear kill switch state and restore connected notification
+                if (isKillSwitchActive) {
+                    isKillSwitchActive = false
+                    val state = vpnRepository.connectionState.first()
+                    val notification = notificationHelper.createVpnNotification(state, isProxyOnly)
+                    val notificationManager = getSystemService(NotificationManager::class.java)
+                    notificationManager.notify(NotificationHelper.VPN_NOTIFICATION_ID, notification)
+                }
 
                 Log.i(TAG, "Successfully reconnected after network change (tunnel type: $currentTunnelType)")
             } finally {
@@ -1938,7 +2415,9 @@ class SlipNetVpnService : VpnService() {
     /**
      * Stop the currently running proxy based on tunnel type.
      * Stops SSH first if enabled, then the DNS tunnel.
+     * Synchronized to prevent double-stop from onDestroy + coroutine cleanup.
      */
+    @Synchronized
     private fun stopCurrentProxy() {
         // Always stop HTTP proxy (it chains through whatever SOCKS5 proxy is running)
         HttpProxyServer.stop()
@@ -1955,7 +2434,8 @@ class SlipNetVpnService : VpnService() {
                 SlipstreamBridge.stopClient()
             }
             TunnelType.DNSTT -> {
-                Log.d(TAG, "Stopping DNSTT proxy")
+                Log.d(TAG, "Stopping DNSTT proxy and bridge")
+                DnsttSocksBridge.stop()
                 DnsttBridge.stopClient()
             }
             TunnelType.SSH -> {
@@ -1971,6 +2451,11 @@ class SlipNetVpnService : VpnService() {
                 Log.d(TAG, "Stopping DoH proxy")
                 DohBridge.stop()
             }
+            TunnelType.NAIVE_SSH -> {
+                Log.d(TAG, "Stopping NaiveProxy+SSH: SSH first, then NaiveProxy")
+                SshTunnelBridge.stop()
+                NaiveBridge.stop()
+            }
             TunnelType.SNOWFLAKE -> {
                 Log.d(TAG, "Stopping Snowflake: TorSocksBridge first, then Snowflake+Tor")
                 TorSocksBridge.stop()
@@ -1984,12 +2469,13 @@ class SlipNetVpnService : VpnService() {
      */
     private fun clearVpnServiceRef() {
         when (currentTunnelType) {
-            TunnelType.SLIPSTREAM -> SlipstreamBridge.setVpnService(null)
-            TunnelType.SLIPSTREAM_SSH -> SlipstreamBridge.setVpnService(null)
+            TunnelType.SLIPSTREAM -> { SlipstreamBridge.proxyOnlyMode = false; SlipstreamBridge.setVpnService(null) }
+            TunnelType.SLIPSTREAM_SSH -> { SlipstreamBridge.proxyOnlyMode = false; SlipstreamBridge.setVpnService(null) }
             TunnelType.DNSTT -> DnsttBridge.setVpnService(null)
             TunnelType.SSH -> { /* SSH-only: no bridge reference to clear */ }
             TunnelType.DNSTT_SSH -> DnsttBridge.setVpnService(null)
             TunnelType.DOH -> { /* DOH: no bridge reference to clear */ }
+            TunnelType.NAIVE_SSH -> { /* NaiveProxy+SSH: no bridge reference to clear */ }
             TunnelType.SNOWFLAKE -> { /* Snowflake: no bridge reference to clear */ }
         }
     }
@@ -2007,10 +2493,11 @@ class SlipNetVpnService : VpnService() {
         return when (currentTunnelType) {
             TunnelType.SLIPSTREAM -> SlipstreamBridge.isClientHealthy() && SlipstreamSocksBridge.isClientHealthy()
             TunnelType.SLIPSTREAM_SSH -> SlipstreamBridge.isClientHealthy() && SshTunnelBridge.isClientHealthy()
-            TunnelType.DNSTT -> DnsttBridge.isClientHealthy()
+            TunnelType.DNSTT -> DnsttBridge.isClientHealthy() && DnsttSocksBridge.isClientHealthy()
             TunnelType.SSH -> SshTunnelBridge.isClientHealthy()
             TunnelType.DNSTT_SSH -> DnsttBridge.isClientHealthy() && SshTunnelBridge.isClientHealthy()
             TunnelType.DOH -> DohBridge.isClientHealthy()
+            TunnelType.NAIVE_SSH -> NaiveBridge.isClientHealthy() && SshTunnelBridge.isClientHealthy()
             TunnelType.SNOWFLAKE -> SnowflakeBridge.isClientHealthy() && TorSocksBridge.isClientHealthy()
         }
     }
@@ -2029,6 +2516,7 @@ class SlipNetVpnService : VpnService() {
                 currentTunnelType == TunnelType.DNSTT_SSH ||
                 currentTunnelType == TunnelType.DOH ||
                 currentTunnelType == TunnelType.SLIPSTREAM ||
+                currentTunnelType == TunnelType.NAIVE_SSH ||
                 currentTunnelType == TunnelType.SNOWFLAKE
 
         val splitEnabled = preferencesDataStore.splitTunnelingEnabled.first()
@@ -2084,13 +2572,14 @@ class SlipNetVpnService : VpnService() {
             val appendProxy = preferencesDataStore.appendHttpProxyToVpn.first()
             if (appendProxy) {
                 val httpPort = preferencesDataStore.httpProxyPort.first()
-                val socksHost = preferencesDataStore.proxyListenAddress.first()
                 val socksPort = preferencesDataStore.proxyListenPort.first()
 
-                // Start HTTP proxy now (before VPN) so it's ready when apps connect
+                // Start HTTP proxy now (before VPN) so it's ready when apps connect.
+                // Always use 127.0.0.1 for SOCKS5 upstream — the tunnel bridge is local.
+                // Using proxyListenAddress (0.0.0.0) as a connection target is unreliable.
                 if (!HttpProxyServer.isRunning()) {
                     val result = HttpProxyServer.start(
-                        socksHost = socksHost,
+                        socksHost = "127.0.0.1",
                         socksPort = socksPort,
                         listenHost = "127.0.0.1",
                         listenPort = httpPort
@@ -2120,6 +2609,9 @@ class SlipNetVpnService : VpnService() {
 
                 when (state) {
                     is ConnectionState.Error -> {
+                        // Don't stop service during kill switch — we're blocking traffic and reconnecting
+                        if (isKillSwitchActive) return@collect
+
                         // Show reconnect notification before stopping
                         if (currentProfileId != -1L) {
                             val reconnectNotification = notificationHelper.createReconnectNotification(
@@ -2143,9 +2635,23 @@ class SlipNetVpnService : VpnService() {
     }
 
     private fun disconnect() {
+        // Mark as user-initiated so onDestroy() doesn't show disconnect notification
+        isUserInitiatedDisconnect = true
+
+        // Clear kill switch so teardown proceeds normally
+        isKillSwitchActive = false
+
         // Cancel any in-progress connection attempt
         connectJob?.cancel()
         connectJob = null
+
+        // Cancel any in-progress reconnection immediately — before the coroutine.
+        // This prevents a race where the reconnect coroutine is mid-flight in native
+        // code (e.g., starting Slipstream on port 1081) while disconnect also tries
+        // to stop/start, leading to "port already in use" on the next connect.
+        reconnectDebounceJob?.cancel()
+        reconnectDebounceJob = null
+        isReconnecting = false
 
         // Cancel state observer to prevent stale stopSelf() calls
         stateObserverJob?.cancel()
@@ -2160,6 +2666,59 @@ class SlipNetVpnService : VpnService() {
             releaseWakeLock()
             stopForeground(STOP_FOREGROUND_REMOVE)
             stopSelf()
+        }
+    }
+
+    /**
+     * Handle tunnel failure with kill switch support.
+     * If kill switch is enabled and we have a VPN interface, enters kill switch mode
+     * (keeps TUN alive to block traffic). Otherwise, does the original teardown.
+     */
+    private suspend fun handleTunnelFailure(reason: String) {
+        val killSwitchEnabled = preferencesDataStore.killSwitch.first()
+        if (killSwitchEnabled && !isProxyOnly && vpnInterface != null) {
+            enterKillSwitchMode(reason)
+        } else {
+            connectionManager.onVpnError("VPN connection lost - $reason")
+            cleanupConnection()
+            stopForeground(STOP_FOREGROUND_REMOVE)
+            stopSelf()
+        }
+    }
+
+    /**
+     * Enter kill switch mode: keep VPN interface alive (blocking all traffic),
+     * stop proxy/tunnel, show kill switch notification, and attempt reconnection.
+     */
+    private suspend fun enterKillSwitchMode(reason: String) {
+        Log.i(TAG, "Kill switch activated: $reason")
+        isKillSwitchActive = true
+
+        // Stop health check during kill switch
+        healthCheckJob?.cancel()
+        healthCheckJob = null
+
+        // Stop proxy/tunnel but NOT vpnInterface — TUN stays alive to block traffic
+        withContext(Dispatchers.IO) {
+            if (!isProxyOnly) {
+                try { HevSocks5Tunnel.stop() } catch (_: Exception) {}
+            }
+            try { stopCurrentProxy() } catch (_: Exception) {}
+        }
+
+        // Update foreground notification to kill switch notification
+        val profile = connectionManager.getProfileById(currentProfileId)
+        val profileName = profile?.name ?: "VPN"
+        val notification = notificationHelper.createKillSwitchNotification(profileName)
+        val notificationManager = getSystemService(NotificationManager::class.java)
+        notificationManager.notify(NotificationHelper.VPN_NOTIFICATION_ID, notification)
+
+        // Attempt reconnection after a brief delay
+        serviceScope.launch {
+            delay(2000)
+            if (isKillSwitchActive) {
+                handleNetworkChange("kill switch reconnect")
+            }
         }
     }
 
@@ -2217,12 +2776,36 @@ class SlipNetVpnService : VpnService() {
 
     override fun onRevoke() {
         super.onRevoke()
-        Log.i(TAG, "VPN permission revoked")
-        disconnect()
+        Log.i(TAG, "VPN permission revoked (another VPN took over)")
+        // Do NOT mark as user-initiated — onRevoke means another VPN took over,
+        // so onDestroy() should show the disconnect notification.
+        // We still need to clean up, but skip setting isUserInitiatedDisconnect.
+        isKillSwitchActive = false
+        connectJob?.cancel()
+        connectJob = null
+        reconnectDebounceJob?.cancel()
+        reconnectDebounceJob = null
+        isReconnecting = false
+        stateObserverJob?.cancel()
+        stateObserverJob = null
+        disconnectJob = serviceScope.launch {
+            Log.i(TAG, "Disconnecting VPN (revoked)")
+            clearConnectionState()
+            cleanupConnection()
+            connectionManager.onVpnDisconnected()
+            releaseWakeLock()
+            stopForeground(STOP_FOREGROUND_REMOVE)
+            stopSelf()
+        }
     }
 
     override fun onDestroy() {
         Log.i(TAG, "Service onDestroy")
+
+        // Capture state before cleanup resets currentProfileId to -1
+        val wasActive = currentProfileId != -1L
+        val profileName = currentProfileName
+        val profileId = currentProfileId
 
         // Quick non-blocking cleanup for onDestroy
         // Don't wait for native threads - they'll clean up themselves
@@ -2235,6 +2818,16 @@ class SlipNetVpnService : VpnService() {
         // Without this, the UI would still show "Connected" after another VPN connects.
         clearConnectionState()
         connectionManager.onVpnDisconnected()
+
+        // Show disconnect notification if the connection was active and not user-initiated.
+        // Skip if kill switch is active (it has its own notification) or if reconnecting
+        // (the reconnect/kill-switch flow handles notifications).
+        if (wasActive && !isUserInitiatedDisconnect && !isKillSwitchActive && !isReconnecting) {
+            Log.i(TAG, "Unexpected disconnect detected, showing notification")
+            val notification = notificationHelper.createDisconnectedNotification(profileName, profileId)
+            val notificationManager = getSystemService(NotificationManager::class.java)
+            notificationManager.notify(NotificationHelper.DISCONNECT_NOTIFICATION_ID, notification)
+        }
 
         // Release WakeLock
         releaseWakeLock()

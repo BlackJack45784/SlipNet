@@ -3,8 +3,12 @@ package app.slipnet.presentation.scanner
 import android.net.Uri
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.animation.AnimatedContent
 import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.SizeTransform
+import androidx.compose.animation.togetherWith
 import androidx.compose.animation.animateColorAsState
+import androidx.compose.animation.core.tween
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
 import androidx.compose.animation.slideInVertically
@@ -12,6 +16,7 @@ import androidx.compose.animation.slideOutVertically
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.layout.ExperimentalLayoutApi
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -48,6 +53,7 @@ import androidx.compose.material.icons.filled.Search
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material.icons.filled.Speed
 import androidx.compose.material.icons.filled.Storage
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Card
@@ -65,6 +71,7 @@ import androidx.compose.material3.Scaffold
 import androidx.compose.material3.SnackbarHost
 import androidx.compose.material3.SnackbarHostState
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
 import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.runtime.Composable
@@ -85,10 +92,14 @@ import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.compose.foundation.layout.FlowRow
 import androidx.hilt.navigation.compose.hiltViewModel
 import app.slipnet.domain.model.ScanMode
+import app.slipnet.tunnel.GeoBypassCountry
 
 private val WorkingGreen = Color(0xFF4CAF50)
+
+private enum class ResolverPanel { NONE, COUNTRY, CUSTOM }
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -129,6 +140,32 @@ fun DnsScannerScreen(
         if (uiState.scannerState.isScanning) {
             onNavigateToResults()
         }
+    }
+
+    // Resume dialog
+    if (uiState.showResumeDialog) {
+        val ss = uiState.scannerState
+        AlertDialog(
+            onDismissRequest = { viewModel.dismissResumeDialog() },
+            title = { Text("Continue Previous Scan?") },
+            text = {
+                Text(
+                    "You scanned ${ss.scannedCount} of ${ss.totalCount} resolvers" +
+                            " and found ${ss.workingCount} working." +
+                            " Continue from where you left off?"
+                )
+            },
+            confirmButton = {
+                Button(onClick = { viewModel.resumeScan() }) {
+                    Text("Continue")
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { viewModel.startFreshScan() }) {
+                    Text("Start Fresh")
+                }
+            }
+        )
     }
 
     val navBarPadding = WindowInsets.navigationBars.asPaddingValues()
@@ -193,8 +230,16 @@ fun DnsScannerScreen(
                 resolverCount = uiState.resolverList.size,
                 listSource = uiState.listSource,
                 isLoading = uiState.isLoadingList,
+                selectedCountry = uiState.selectedCountry,
+                sampleCount = uiState.sampleCount,
+                customRangeInput = uiState.customRangeInput,
                 onLoadDefault = { viewModel.loadDefaultList() },
-                onImportFile = { filePickerLauncher.launch("text/*") }
+                onImportFile = { filePickerLauncher.launch("text/*") },
+                onSelectCountry = { viewModel.updateSelectedCountry(it) },
+                onSelectSampleCount = { viewModel.updateSampleCount(it) },
+                onGenerateCountryList = { viewModel.loadCountryRangeList() },
+                onCustomRangeInputChange = { viewModel.updateCustomRangeInput(it) },
+                onLoadCustomRange = { viewModel.loadCustomRangeList() }
             )
 
             // Recent DNS
@@ -517,14 +562,33 @@ private fun ScanModeChip(
     }
 }
 
+@OptIn(ExperimentalLayoutApi::class)
 @Composable
 private fun ResolverListSection(
     resolverCount: Int,
     listSource: ListSource,
     isLoading: Boolean,
+    selectedCountry: GeoBypassCountry,
+    sampleCount: Int,
+    customRangeInput: String,
     onLoadDefault: () -> Unit,
-    onImportFile: () -> Unit
+    onImportFile: () -> Unit,
+    onSelectCountry: (GeoBypassCountry) -> Unit,
+    onSelectSampleCount: (Int) -> Unit,
+    onGenerateCountryList: () -> Unit,
+    onCustomRangeInputChange: (String) -> Unit,
+    onLoadCustomRange: () -> Unit
 ) {
+    var activePanel by remember {
+        mutableStateOf(
+            when (listSource) {
+                ListSource.COUNTRY_RANGE -> ResolverPanel.COUNTRY
+                ListSource.CUSTOM_RANGE -> ResolverPanel.CUSTOM
+                else -> ResolverPanel.NONE
+            }
+        )
+    }
+
     Card(
         modifier = Modifier.fillMaxWidth(),
         colors = CardDefaults.cardColors(
@@ -580,6 +644,8 @@ private fun ResolverListSection(
                         text = when (listSource) {
                             ListSource.DEFAULT -> "Built-in list"
                             ListSource.IMPORTED -> "Imported from file"
+                            ListSource.COUNTRY_RANGE -> "${selectedCountry.displayName} IP range ($sampleCount random IPs)"
+                            ListSource.CUSTOM_RANGE -> "Custom range ($resolverCount IPs)"
                         },
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant
@@ -589,10 +655,13 @@ private fun ResolverListSection(
 
             Row(
                 modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.spacedBy(12.dp)
+                horizontalArrangement = Arrangement.spacedBy(8.dp)
             ) {
                 OutlinedButton(
-                    onClick = onLoadDefault,
+                    onClick = {
+                        activePanel = ResolverPanel.NONE
+                        onLoadDefault()
+                    },
                     modifier = Modifier.weight(1f),
                     shape = RoundedCornerShape(12.dp),
                     contentPadding = PaddingValues(vertical = 10.dp)
@@ -600,14 +669,17 @@ private fun ResolverListSection(
                     Icon(
                         Icons.Default.Refresh,
                         contentDescription = null,
-                        modifier = Modifier.size(18.dp)
+                        modifier = Modifier.size(16.dp)
                     )
-                    Spacer(Modifier.width(8.dp))
-                    Text("Default")
+                    Spacer(Modifier.width(6.dp))
+                    Text("Default", maxLines = 1)
                 }
 
                 OutlinedButton(
-                    onClick = onImportFile,
+                    onClick = {
+                        activePanel = ResolverPanel.NONE
+                        onImportFile()
+                    },
                     modifier = Modifier.weight(1f),
                     shape = RoundedCornerShape(12.dp),
                     contentPadding = PaddingValues(vertical = 10.dp)
@@ -615,10 +687,218 @@ private fun ResolverListSection(
                     Icon(
                         Icons.Default.FileUpload,
                         contentDescription = null,
-                        modifier = Modifier.size(18.dp)
+                        modifier = Modifier.size(16.dp)
                     )
-                    Spacer(Modifier.width(8.dp))
-                    Text("Import")
+                    Spacer(Modifier.width(6.dp))
+                    Text("Import", maxLines = 1)
+                }
+            }
+
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                OutlinedButton(
+                    onClick = {
+                        activePanel = if (activePanel == ResolverPanel.COUNTRY) ResolverPanel.NONE else ResolverPanel.COUNTRY
+                    },
+                    modifier = Modifier.weight(1f),
+                    shape = RoundedCornerShape(12.dp),
+                    contentPadding = PaddingValues(vertical = 10.dp),
+                    colors = if (activePanel == ResolverPanel.COUNTRY || listSource == ListSource.COUNTRY_RANGE) {
+                        ButtonDefaults.outlinedButtonColors(
+                            containerColor = MaterialTheme.colorScheme.primaryContainer
+                        )
+                    } else {
+                        ButtonDefaults.outlinedButtonColors()
+                    }
+                ) {
+                    Icon(
+                        Icons.Default.Search,
+                        contentDescription = null,
+                        modifier = Modifier.size(16.dp)
+                    )
+                    Spacer(Modifier.width(6.dp))
+                    Text("Country", maxLines = 1)
+                }
+
+                OutlinedButton(
+                    onClick = {
+                        activePanel = if (activePanel == ResolverPanel.CUSTOM) ResolverPanel.NONE else ResolverPanel.CUSTOM
+                    },
+                    modifier = Modifier.weight(1f),
+                    shape = RoundedCornerShape(12.dp),
+                    contentPadding = PaddingValues(vertical = 10.dp),
+                    colors = if (activePanel == ResolverPanel.CUSTOM || listSource == ListSource.CUSTOM_RANGE) {
+                        ButtonDefaults.outlinedButtonColors(
+                            containerColor = MaterialTheme.colorScheme.primaryContainer
+                        )
+                    } else {
+                        ButtonDefaults.outlinedButtonColors()
+                    }
+                ) {
+                    Icon(
+                        Icons.Default.Dns,
+                        contentDescription = null,
+                        modifier = Modifier.size(16.dp)
+                    )
+                    Spacer(Modifier.width(6.dp))
+                    Text("Custom", maxLines = 1)
+                }
+            }
+
+            // Country / Custom range panel (single AnimatedContent to avoid double-layout)
+            AnimatedContent(
+                targetState = activePanel,
+                transitionSpec = {
+                    fadeIn(tween(250)) togetherWith fadeOut(tween(150)) using
+                            SizeTransform(clip = false, sizeAnimationSpec = { _, _ -> tween(300) })
+                },
+                label = "resolverPanel"
+            ) { panel ->
+                when (panel) {
+                    ResolverPanel.CUSTOM -> {
+                        Column(
+                            verticalArrangement = Arrangement.spacedBy(12.dp)
+                        ) {
+                            OutlinedTextField(
+                                value = customRangeInput,
+                                onValueChange = onCustomRangeInputChange,
+                                label = { Text("IP Ranges") },
+                                placeholder = { Text("8.8.8.0/24\n1.1.1.1-1.1.1.10\n9.9.9.9") },
+                                supportingText = { Text("One per line: CIDR, range, or single IP") },
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .height(140.dp),
+                                shape = RoundedCornerShape(12.dp),
+                                maxLines = 8
+                            )
+
+                            FilledTonalButton(
+                                onClick = onLoadCustomRange,
+                                enabled = !isLoading && customRangeInput.isNotBlank(),
+                                modifier = Modifier.fillMaxWidth(),
+                                shape = RoundedCornerShape(12.dp)
+                            ) {
+                                if (isLoading) {
+                                    CircularProgressIndicator(
+                                        modifier = Modifier.size(18.dp),
+                                        strokeWidth = 2.dp
+                                    )
+                                } else {
+                                    Icon(
+                                        Icons.Default.PlayArrow,
+                                        contentDescription = null,
+                                        modifier = Modifier.size(18.dp)
+                                    )
+                                }
+                                Spacer(Modifier.width(8.dp))
+                                Text("Load IPs")
+                            }
+
+                            AnimatedVisibility(
+                                visible = listSource == ListSource.CUSTOM_RANGE && !isLoading && resolverCount > 0
+                            ) {
+                                Text(
+                                    text = "Ready! Scroll up and tap Start Scan to begin.",
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.primary,
+                                    fontWeight = FontWeight.Medium,
+                                    textAlign = TextAlign.Center,
+                                    modifier = Modifier.fillMaxWidth()
+                                )
+                            }
+                        }
+                    }
+
+                    ResolverPanel.COUNTRY -> {
+                        Column(
+                            verticalArrangement = Arrangement.spacedBy(12.dp)
+                        ) {
+                            // Country selector
+                            Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                                Text(
+                                    text = "Country",
+                                    style = MaterialTheme.typography.labelMedium,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                                )
+                                FlowRow(
+                                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                                    verticalArrangement = Arrangement.spacedBy(8.dp)
+                                ) {
+                                    GeoBypassCountry.entries.forEach { country ->
+                                        OptionChip(
+                                            selected = selectedCountry == country,
+                                            onClick = { onSelectCountry(country) },
+                                            label = country.displayName
+                                        )
+                                    }
+                                }
+                            }
+
+                            // Sample count selector
+                            Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                                Text(
+                                    text = "Sample Size",
+                                    style = MaterialTheme.typography.labelMedium,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                                )
+                                FlowRow(
+                                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                                    verticalArrangement = Arrangement.spacedBy(8.dp)
+                                ) {
+                                    listOf(1000, 2000, 5000, 10000).forEach { count ->
+                                        OptionChip(
+                                            selected = sampleCount == count,
+                                            onClick = { onSelectSampleCount(count) },
+                                            label = count.toString()
+                                        )
+                                    }
+                                }
+                            }
+
+                            // Generate button
+                            FilledTonalButton(
+                                onClick = onGenerateCountryList,
+                                enabled = !isLoading,
+                                modifier = Modifier.fillMaxWidth(),
+                                shape = RoundedCornerShape(12.dp)
+                            ) {
+                                if (isLoading) {
+                                    CircularProgressIndicator(
+                                        modifier = Modifier.size(18.dp),
+                                        strokeWidth = 2.dp
+                                    )
+                                } else {
+                                    Icon(
+                                        Icons.Default.PlayArrow,
+                                        contentDescription = null,
+                                        modifier = Modifier.size(18.dp)
+                                    )
+                                }
+                                Spacer(Modifier.width(8.dp))
+                                Text("Generate ${selectedCountry.displayName} IPs")
+                            }
+
+                            // Hint after generation
+                            AnimatedVisibility(
+                                visible = listSource == ListSource.COUNTRY_RANGE && !isLoading && resolverCount > 0
+                            ) {
+                                Text(
+                                    text = "Ready! Scroll up and tap Start Scan to begin.",
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.primary,
+                                    fontWeight = FontWeight.Medium,
+                                    textAlign = TextAlign.Center,
+                                    modifier = Modifier.fillMaxWidth()
+                                )
+                            }
+                        }
+                    }
+
+                    ResolverPanel.NONE -> {
+                        // Empty — no extra panel shown
+                    }
                 }
             }
         }
@@ -728,6 +1008,58 @@ private fun RecentDnsSection(
                     Text("Apply Selected")
                 }
             }
+        }
+    }
+}
+
+@Composable
+private fun OptionChip(
+    selected: Boolean,
+    onClick: () -> Unit,
+    label: String
+) {
+    val backgroundColor by animateColorAsState(
+        targetValue = if (selected) MaterialTheme.colorScheme.primaryContainer
+        else MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f),
+        label = "optionChipBg"
+    )
+    val borderColor by animateColorAsState(
+        targetValue = if (selected) MaterialTheme.colorScheme.primary
+        else MaterialTheme.colorScheme.outline.copy(alpha = 0.3f),
+        label = "optionChipBorder"
+    )
+
+    Box(
+        modifier = Modifier
+            .clip(RoundedCornerShape(10.dp))
+            .border(
+                width = if (selected) 1.5.dp else 1.dp,
+                color = borderColor,
+                shape = RoundedCornerShape(10.dp)
+            )
+            .background(backgroundColor)
+            .clickable(onClick = onClick)
+            .padding(horizontal = 14.dp, vertical = 8.dp)
+    ) {
+        Row(
+            horizontalArrangement = Arrangement.spacedBy(4.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            if (selected) {
+                Icon(
+                    Icons.Default.Check,
+                    contentDescription = null,
+                    tint = MaterialTheme.colorScheme.primary,
+                    modifier = Modifier.size(14.dp)
+                )
+            }
+            Text(
+                text = label,
+                style = MaterialTheme.typography.labelLarge,
+                fontWeight = if (selected) FontWeight.SemiBold else FontWeight.Medium,
+                color = if (selected) MaterialTheme.colorScheme.primary
+                else MaterialTheme.colorScheme.onSurface
+            )
         }
     }
 }

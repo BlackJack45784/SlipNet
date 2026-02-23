@@ -15,6 +15,9 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
+import app.slipnet.tunnel.DomainRouter
+import java.io.BufferedReader
+import java.io.InputStreamReader
 import java.net.DatagramPacket
 import java.net.DatagramSocket
 import java.net.InetAddress
@@ -106,7 +109,9 @@ class ResolverScannerRepositoryImpl @Inject constructor(
     }
 
     /**
-     * Simple ping scan - just check if resolver responds to A record query
+     * Simple ping scan - check if resolver responds to A record query.
+     * Uses a single reused socket with pre-resolved address and nanoTime for precision.
+     * Runs 1 warm-up query (discarded) + 4 measured queries, reports the median.
      */
     private suspend fun scanResolverSimple(
         host: String,
@@ -115,38 +120,140 @@ class ResolverScannerRepositoryImpl @Inject constructor(
         timeoutMs: Long,
         startTime: Long
     ): ResolverScanResult = withContext(Dispatchers.IO) {
-        val result = withTimeoutOrNull(timeoutMs) {
-            performDnsQuery(host, port, testDomain, DNS_TYPE_A)
-        }
+        var socket: DatagramSocket? = null
+        try {
+            // Pre-resolve address and create socket OUTSIDE the measurement window
+            val serverAddress = InetAddress.getByName(host)
+            socket = DatagramSocket()
+            socket.soTimeout = timeoutMs.coerceAtMost(3000).toInt()
 
-        val responseTime = System.currentTimeMillis() - startTime
+            val responseBuffer = ByteArray(512)
 
-        when {
-            result == null -> ResolverScanResult(
-                host = host,
-                port = port,
-                status = ResolverStatus.TIMEOUT,
-                responseTimeMs = responseTime
-            )
-            result.isCensored -> ResolverScanResult(
-                host = host,
-                port = port,
-                status = ResolverStatus.CENSORED,
-                responseTimeMs = responseTime,
-                errorMessage = "Hijacked to ${result.resolvedIp}"
-            )
-            result.success -> ResolverScanResult(
+            // Warm-up query — pays for any OS/network path setup, result discarded
+            val warmupResult = try {
+                performDnsQueryOnSocket(socket, serverAddress, port, testDomain, DNS_TYPE_A, responseBuffer)
+            } catch (_: Exception) { null }
+
+            if (warmupResult == null) {
+                val responseTime = System.currentTimeMillis() - startTime
+                return@withContext ResolverScanResult(
+                    host = host, port = port,
+                    status = ResolverStatus.TIMEOUT,
+                    responseTimeMs = responseTime
+                )
+            }
+            if (warmupResult.isCensored) {
+                val responseTime = System.currentTimeMillis() - startTime
+                return@withContext ResolverScanResult(
+                    host = host, port = port,
+                    status = ResolverStatus.CENSORED,
+                    responseTimeMs = responseTime,
+                    errorMessage = "Hijacked to ${warmupResult.resolvedIp}"
+                )
+            }
+            if (!warmupResult.success) {
+                val responseTime = System.currentTimeMillis() - startTime
+                return@withContext ResolverScanResult(
+                    host = host, port = port,
+                    status = ResolverStatus.ERROR,
+                    responseTimeMs = responseTime,
+                    errorMessage = warmupResult.error
+                )
+            }
+
+            // 4 measured queries — only time send+receive (pure network RTT)
+            val samples = mutableListOf<Long>()
+            for (i in 0 until 4) {
+                val elapsed = System.currentTimeMillis() - startTime
+                if (elapsed >= timeoutMs) break
+                try {
+                    val t0 = System.nanoTime()
+                    val result = performDnsQueryOnSocket(socket, serverAddress, port, testDomain, DNS_TYPE_A, responseBuffer)
+                    val rttNs = System.nanoTime() - t0
+                    if (result.success) {
+                        samples.add(rttNs / 1_000_000) // ns → ms
+                    }
+                } catch (_: Exception) { /* skip failed sample */ }
+            }
+
+            if (samples.isEmpty()) {
+                val responseTime = System.currentTimeMillis() - startTime
+                return@withContext ResolverScanResult(
+                    host = host, port = port,
+                    status = ResolverStatus.TIMEOUT,
+                    responseTimeMs = responseTime
+                )
+            }
+
+            val medianTime = samples.sorted()[samples.size / 2]
+
+            ResolverScanResult(
                 host = host,
                 port = port,
                 status = ResolverStatus.WORKING,
-                responseTimeMs = responseTime
+                responseTimeMs = medianTime
             )
-            else -> ResolverScanResult(
-                host = host,
-                port = port,
+        } catch (e: Exception) {
+            val responseTime = System.currentTimeMillis() - startTime
+            ResolverScanResult(
+                host = host, port = port,
                 status = ResolverStatus.ERROR,
                 responseTimeMs = responseTime,
-                errorMessage = result.error
+                errorMessage = e.message ?: "Unknown error"
+            )
+        } finally {
+            socket?.close()
+        }
+    }
+
+    /**
+     * Send a DNS query on an existing socket (no socket/address creation overhead).
+     * Caller owns the socket lifecycle.
+     */
+    private fun performDnsQueryOnSocket(
+        socket: DatagramSocket,
+        serverAddress: InetAddress,
+        port: Int,
+        domain: String,
+        recordType: Int,
+        responseBuffer: ByteArray
+    ): DnsQueryResult {
+        val dnsQuery = buildDnsQuery(domain, recordType)
+        val requestPacket = DatagramPacket(dnsQuery, dnsQuery.size, serverAddress, port)
+
+        socket.send(requestPacket)
+
+        val responsePacket = DatagramPacket(responseBuffer, responseBuffer.size)
+        socket.receive(responsePacket)
+
+        val responseCode = if (responsePacket.length >= 4) {
+            responseBuffer[3].toInt() and 0x0F
+        } else 0
+
+        if (recordType == DNS_TYPE_A) {
+            val resolvedIp = parseDnsResponse(responseBuffer, responsePacket.length)
+            if (resolvedIp != null) {
+                val isCensored = resolvedIp.startsWith("10.") ||
+                        resolvedIp == "0.0.0.0" ||
+                        resolvedIp.startsWith("127.")
+                return DnsQueryResult(
+                    success = true,
+                    resolvedIp = resolvedIp,
+                    isCensored = isCensored,
+                    responseCode = responseCode
+                )
+            } else {
+                return DnsQueryResult(
+                    success = responseCode == 0 || responseCode == 3,
+                    error = if (responseCode != 0 && responseCode != 3) "Response code: $responseCode" else null,
+                    responseCode = responseCode
+                )
+            }
+        } else {
+            return DnsQueryResult(
+                success = responseCode == 0 || responseCode == 3,
+                responseCode = responseCode,
+                error = if (responseCode != 0 && responseCode != 3) "Response code: $responseCode" else null
             )
         }
     }
@@ -265,6 +372,88 @@ class ResolverScannerRepositoryImpl @Inject constructor(
         } catch (e: Exception) {
             false
         }
+    }
+
+    override fun expandIpRanges(ranges: List<Pair<Long, Long>>): List<String> {
+        val result = mutableListOf<String>()
+        for ((start, end) in ranges) {
+            var ip = start
+            while (ip <= end) {
+                result.add(longToIp(ip))
+                ip++
+            }
+        }
+        return result
+    }
+
+    override fun generateCountryRangeIps(
+        context: android.content.Context,
+        countryCode: String,
+        count: Int
+    ): List<String> {
+        val ranges = loadCidrRanges(context, countryCode)
+        if (ranges.isEmpty()) return emptyList()
+
+        // Precompute cumulative sizes for proportional sampling
+        val cumulativeSizes = LongArray(ranges.size)
+        var cumulative = 0L
+        for (i in ranges.indices) {
+            val (start, end) = ranges[i]
+            cumulative += (end - start + 1)
+            cumulativeSizes[i] = cumulative
+        }
+        val totalIps = cumulative
+
+        val result = mutableSetOf<String>()
+        val maxAttempts = count * 3 // avoid infinite loop on small ranges
+        var attempts = 0
+
+        while (result.size < count && attempts < maxAttempts) {
+            attempts++
+            // Pick a random position in the total IP space
+            val pos = (Random.nextLong(totalIps) and 0x7FFFFFFFFFFFFFFFL) % totalIps
+
+            // Binary search for which range this falls into
+            var lo = 0
+            var hi = ranges.size - 1
+            while (lo < hi) {
+                val mid = (lo + hi) / 2
+                if (cumulativeSizes[mid] <= pos) lo = mid + 1 else hi = mid
+            }
+
+            val (start, _) = ranges[lo]
+            val offset = pos - (if (lo > 0) cumulativeSizes[lo - 1] else 0L)
+            val ip = start + offset
+            result.add(longToIp(ip))
+        }
+
+        return result.toList()
+    }
+
+    private fun loadCidrRanges(context: android.content.Context, countryCode: String): List<Pair<Long, Long>> {
+        val ranges = mutableListOf<Pair<Long, Long>>()
+        try {
+            context.assets.open("geo/$countryCode.cidr").use { stream ->
+                BufferedReader(InputStreamReader(stream)).use { reader ->
+                    reader.forEachLine { line ->
+                        val trimmed = line.trim()
+                        if (trimmed.isNotEmpty()) {
+                            val range = DomainRouter.parseCidr(trimmed)
+                            if (range != null) {
+                                ranges.add(range)
+                            }
+                        }
+                    }
+                }
+            }
+        } catch (_: Exception) {
+            // Asset file not found
+        }
+        return ranges
+    }
+
+    private fun longToIp(ip: Long): String {
+        return "${(ip shr 24) and 0xFF}.${(ip shr 16) and 0xFF}.${(ip shr 8) and 0xFF}.${ip and 0xFF}"
     }
 
     override fun scanResolvers(

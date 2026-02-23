@@ -54,6 +54,12 @@
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data android:scheme="slipnet" />
+            </intent-filter>
         </activity>
 
         <!-- VPN Service -->
@@ -81,9 +87,6 @@
                 <action android:name="android.service.quicksettings.action.QS_TILE" />
             </intent-filter>
             <meta-data
-                android:name="android.service.quicksettings.ACTIVE_TILE"
-                android:value="true" />
-            <meta-data
                 android:name="android.service.quicksettings.TOGGLEABLE_TILE"
                 android:value="true" />
         </service>
@@ -99,9 +102,35 @@
             </intent-filter>
         </receiver>
 
+        <!-- Home Screen Widget (2x1) -->
+        <receiver
+            android:name=".widget.VpnWidgetProvider"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.appwidget.action.APPWIDGET_UPDATE" />
+                <action android:name="app.slipnet.widget.TOGGLE_VPN" />
+            </intent-filter>
+            <meta-data
+                android:name="android.appwidget.provider"
+                android:resource="@xml/widget_vpn_toggle_info" />
+        </receiver>
+
+        <!-- Compact Home Screen Widget (1x1) -->
+        <receiver
+            android:name=".widget.VpnWidgetCompactProvider"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.appwidget.action.APPWIDGET_UPDATE" />
+                <action android:name="app.slipnet.widget.TOGGLE_VPN_COMPACT" />
+            </intent-filter>
+            <meta-data
+                android:name="android.appwidget.provider"
+                android:resource="@xml/widget_vpn_compact_info" />
+        </receiver>
+
         <!-- QR code scanner (force portrait) -->
         <activity
-            android:name="com.journeyapps.barcodescanner.CaptureActivity"
+            android:name=".presentation.scanner.QrScannerActivity"
             android:screenOrientation="portrait"
             tools:replace="screenOrientation" />
 

@@ -26,8 +26,6 @@ data class ServerProfile(
     val sshPort: Int = 22,
     // SSH host as seen from DNSTT server (for DNSTT+SSH, default 127.0.0.1 for co-located servers)
     val sshHost: String = "127.0.0.1",
-    // When true, DNS queries go to server's local resolver (127.0.0.53) instead of VPN DNS (e.g. 1.1.1.1)
-    val useServerDns: Boolean = false,
     // DoH (DNS over HTTPS) server URL
     val dohUrl: String = "",
     // Timestamp of last successful connection (0 = never connected)
@@ -44,7 +42,13 @@ data class ServerProfile(
     // Transport is auto-detected from bridge line prefix (obfs4, webtunnel, meek_lite, etc.)
     val torBridgeLines: String = "",
     // User-defined sort order for profile list (lower = higher in list)
-    val sortOrder: Int = 0
+    val sortOrder: Int = 0,
+    // When true, DNSTT uses aggressive query rates (authoritative mode for own servers)
+    val dnsttAuthoritative: Boolean = false,
+    // NaiveProxy fields (NAIVE_SSH tunnel type)
+    val naivePort: Int = 443,
+    val naiveUsername: String = "",
+    val naivePassword: String = ""
 )
 
 data class DnsResolver(
@@ -71,7 +75,8 @@ enum class TunnelType(val value: String, val displayName: String) {
     DNSTT_SSH("dnstt_ssh", "DNSTT + SSH"),
     SSH("ssh", "SSH"),
     DOH("doh", "DOH (DNS over HTTPS)"),
-    SNOWFLAKE("snowflake", "Tor");
+    SNOWFLAKE("snowflake", "Tor"),
+    NAIVE_SSH("naive_ssh", "SlipGate");
 
     companion object {
         fun fromValue(value: String): TunnelType {
@@ -102,4 +107,5 @@ enum class DnsTransport(val value: String, val displayName: String) {
         }
     }
 }
+
 

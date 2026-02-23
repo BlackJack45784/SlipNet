@@ -1,7 +1,7 @@
 package app.slipnet.tunnel
 
 import android.net.VpnService
-import android.util.Log
+import app.slipnet.util.AppLog as Log
 import mobile.Mobile
 import mobile.DnsttClient
 import java.lang.ref.WeakReference
@@ -15,6 +15,7 @@ object DnsttBridge {
     private const val TAG = "DnsttBridge"
 
     private var client: DnsttClient? = null
+    private var currentPort: Int = 0
     private var vpnServiceRef: WeakReference<VpnService>? = null
 
     /**
@@ -40,7 +41,8 @@ object DnsttBridge {
         tunnelDomain: String,
         publicKey: String,
         listenPort: Int,
-        listenHost: String = "127.0.0.1"
+        listenHost: String = "127.0.0.1",
+        authoritativeMode: Boolean = false
     ): Result<Unit> {
         Log.i(TAG, "========================================")
         Log.i(TAG, "Starting DNSTT client")
@@ -48,6 +50,7 @@ object DnsttBridge {
         Log.i(TAG, "  Tunnel Domain: $tunnelDomain")
         Log.i(TAG, "  Public Key: ${publicKey.take(16)}...")
         Log.i(TAG, "  Listen: $listenHost:$listenPort")
+        Log.i(TAG, "  Authoritative Mode: $authoritativeMode")
         Log.i(TAG, "========================================")
 
         // Validate inputs
@@ -84,7 +87,9 @@ object DnsttBridge {
 
             // Create the DNSTT client via Go mobile bindings
             val newClient = Mobile.newClient(dnsAddr, tunnelDomain, publicKey, listenAddr)
+            newClient.setAuthoritativeMode(authoritativeMode)
             client = newClient
+            currentPort = listenPort
 
             // Start the client
             newClient.start()
@@ -116,21 +121,26 @@ object DnsttBridge {
     }
 
     /**
-     * Stop the DNSTT client.
+     * Stop the DNSTT client and wait for port to be released.
      */
     fun stopClient() {
-        client?.let { c ->
-            try {
-                Log.d(TAG, "Stopping DNSTT client...")
-                c.stop()
-                Log.d(TAG, "DNSTT client stopped")
-                // Wait for port to be released
-                Thread.sleep(500)
-            } catch (e: Exception) {
-                Log.e(TAG, "Error stopping DNSTT client", e)
+        val c = client ?: return
+        client = null  // Clear reference immediately to prevent new operations
+        try {
+            Log.d(TAG, "Stopping DNSTT client...")
+            c.stop()
+            // Verify port is actually released instead of blind sleep.
+            // Go's listener.Close() is synchronous, but give the OS a moment.
+            Thread.sleep(200)
+            val port = currentPort
+            if (port > 0 && isPortInUse(port)) {
+                Log.w(TAG, "Port $port still in use after DNSTT stop, waiting...")
+                waitForPortAvailable(port, 3000)
             }
+            Log.d(TAG, "DNSTT client stopped")
+        } catch (e: Exception) {
+            Log.e(TAG, "Error stopping DNSTT client", e)
         }
-        client = null
     }
 
     /**

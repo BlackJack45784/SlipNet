@@ -78,9 +78,6 @@ data class ProfileEntity(
     @ColumnInfo(name = "ssh_host", defaultValue = "127.0.0.1")
     val sshHost: String = "127.0.0.1",
 
-    @ColumnInfo(name = "use_server_dns", defaultValue = "0")
-    val useServerDns: Boolean = false,
-
     @ColumnInfo(name = "doh_url", defaultValue = "")
     val dohUrl: String = "",
 
@@ -103,5 +100,17 @@ data class ProfileEntity(
     val torBridgeLines: String = "",
 
     @ColumnInfo(name = "sort_order", defaultValue = "0")
-    val sortOrder: Int = 0
+    val sortOrder: Int = 0,
+
+    @ColumnInfo(name = "dnstt_authoritative", defaultValue = "0")
+    val dnsttAuthoritative: Boolean = false,
+
+    @ColumnInfo(name = "naive_port", defaultValue = "443")
+    val naivePort: Int = 443,
+
+    @ColumnInfo(name = "naive_username", defaultValue = "")
+    val naiveUsername: String = "",
+
+    @ColumnInfo(name = "naive_password", defaultValue = "")
+    val naivePassword: String = ""
 )

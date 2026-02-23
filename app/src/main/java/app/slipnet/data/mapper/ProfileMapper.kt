@@ -46,7 +46,6 @@ class ProfileMapper @Inject constructor(
             sshPassword = entity.sshPassword,
             sshPort = entity.sshPort,
             sshHost = entity.sshHost,
-            useServerDns = entity.useServerDns,
             dohUrl = entity.dohUrl,
             lastConnectedAt = entity.lastConnectedAt,
             dnsTransport = DnsTransport.fromValue(entity.dnsTransport),
@@ -54,7 +53,11 @@ class ProfileMapper @Inject constructor(
             sshPrivateKey = entity.sshPrivateKey,
             sshKeyPassphrase = entity.sshKeyPassphrase,
             torBridgeLines = entity.torBridgeLines,
-            sortOrder = entity.sortOrder
+            sortOrder = entity.sortOrder,
+            dnsttAuthoritative = entity.dnsttAuthoritative,
+            naivePort = entity.naivePort,
+            naiveUsername = entity.naiveUsername,
+            naivePassword = entity.naivePassword
         )
     }
 
@@ -79,13 +82,12 @@ class ProfileMapper @Inject constructor(
             updatedAt = profile.updatedAt,
             tunnelType = profile.tunnelType.value,
             dnsttPublicKey = profile.dnsttPublicKey,
-            sshEnabled = profile.tunnelType == TunnelType.SSH || profile.tunnelType == TunnelType.DNSTT_SSH || profile.tunnelType == TunnelType.SLIPSTREAM_SSH,
+            sshEnabled = profile.tunnelType == TunnelType.SSH || profile.tunnelType == TunnelType.DNSTT_SSH || profile.tunnelType == TunnelType.SLIPSTREAM_SSH || profile.tunnelType == TunnelType.NAIVE_SSH,
             sshUsername = profile.sshUsername,
             sshPassword = profile.sshPassword,
             sshPort = profile.sshPort,
             forwardDnsThroughSsh = false,
             sshHost = profile.sshHost,
-            useServerDns = profile.useServerDns,
             dohUrl = profile.dohUrl,
             lastConnectedAt = profile.lastConnectedAt,
             dnsTransport = profile.dnsTransport.value,
@@ -93,7 +95,11 @@ class ProfileMapper @Inject constructor(
             sshPrivateKey = profile.sshPrivateKey,
             sshKeyPassphrase = profile.sshKeyPassphrase,
             torBridgeLines = profile.torBridgeLines,
-            sortOrder = profile.sortOrder
+            sortOrder = profile.sortOrder,
+            dnsttAuthoritative = profile.dnsttAuthoritative,
+            naivePort = profile.naivePort,
+            naiveUsername = profile.naiveUsername,
+            naivePassword = profile.naivePassword
         )
     }
 

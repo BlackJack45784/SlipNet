@@ -24,10 +24,15 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
+import androidx.compose.material.icons.automirrored.filled.Send
 import androidx.compose.material.icons.filled.Check
+import androidx.compose.material.icons.filled.Email
+import androidx.compose.material.icons.filled.Language
 import androidx.compose.material.icons.filled.Search
 import androidx.compose.material.icons.filled.Speed
 import androidx.compose.material.icons.filled.OpenInNew
+import androidx.compose.material.icons.filled.Send
+import androidx.compose.material.icons.filled.SmartToy
 import androidx.compose.material.icons.filled.Warning
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
@@ -177,12 +182,21 @@ fun EditProfileScreen(
                     OutlinedTextField(
                         value = uiState.domain,
                         onValueChange = { viewModel.updateDomain(it) },
-                        label = { Text(if (uiState.isSshOnly) "SSH Server" else "Domain") },
+                        label = {
+                            Text(
+                                when {
+                                    uiState.isSshOnly -> "SSH Server"
+                                    uiState.isNaiveSsh -> "Server"
+                                    else -> "Domain"
+                                }
+                            )
+                        },
                         placeholder = {
                             Text(
                                 when {
                                     uiState.isDnsttBased -> "t.example.com"
                                     uiState.isSshOnly -> "ssh.example.com"
+                                    uiState.isNaiveSsh -> "proxy.example.com"
                                     else -> "vpn.example.com"
                                 }
                             )
@@ -193,6 +207,7 @@ fun EditProfileScreen(
                                 uiState.domainError ?: when {
                                     uiState.isDnsttBased -> "DNSTT tunnel domain"
                                     uiState.isSlipstreamBased -> "Slipstream tunnel domain"
+                                    uiState.isNaiveSsh -> "Caddy server hostname"
                                     else -> "SSH server hostname or IP"
                                 }
                             )
@@ -243,6 +258,74 @@ fun EditProfileScreen(
                                     color = MaterialTheme.colorScheme.onErrorContainer
                                 )
                             }
+                        }
+                    }
+                }
+
+                // NaiveProxy fields (shown only for NAIVE_SSH)
+                if (uiState.isNaiveSsh) {
+                    OutlinedTextField(
+                        value = uiState.naivePort,
+                        onValueChange = { viewModel.updateNaivePort(it) },
+                        label = { Text("Server Port") },
+                        placeholder = { Text("443") },
+                        isError = uiState.naivePortError != null,
+                        supportingText = uiState.naivePortError?.let { { Text(it) } },
+                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                        singleLine = true,
+                        modifier = Modifier.fillMaxWidth()
+                    )
+                    OutlinedTextField(
+                        value = uiState.naiveUsername,
+                        onValueChange = { viewModel.updateNaiveUsername(it) },
+                        label = { Text("Proxy Username") },
+                        placeholder = { Text("HTTP proxy auth username") },
+                        isError = uiState.naiveUsernameError != null,
+                        supportingText = uiState.naiveUsernameError?.let { { Text(it) } },
+                        singleLine = true,
+                        modifier = Modifier.fillMaxWidth()
+                    )
+                    OutlinedTextField(
+                        value = uiState.naivePassword,
+                        onValueChange = { viewModel.updateNaivePassword(it) },
+                        label = { Text("Proxy Password") },
+                        placeholder = { Text("HTTP proxy auth password") },
+                        isError = uiState.naivePasswordError != null,
+                        supportingText = uiState.naivePasswordError?.let { { Text(it) } },
+                        singleLine = true,
+                        visualTransformation = PasswordVisualTransformation(),
+                        modifier = Modifier.fillMaxWidth()
+                    )
+                    Surface(
+                        onClick = {
+                            val intent = android.content.Intent(
+                                android.content.Intent.ACTION_VIEW,
+                                android.net.Uri.parse("https://github.com/anonvector/slipgate")
+                            )
+                            context.startActivity(intent)
+                        },
+                        shape = MaterialTheme.shapes.small,
+                        color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f),
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(vertical = 12.dp, horizontal = 12.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Icon(
+                                Icons.Default.OpenInNew,
+                                contentDescription = null,
+                                modifier = Modifier.size(18.dp),
+                                tint = MaterialTheme.colorScheme.primary
+                            )
+                            Spacer(Modifier.width(8.dp))
+                            Text(
+                                "Server setup guide",
+                                style = MaterialTheme.typography.bodyMedium,
+                                color = MaterialTheme.colorScheme.primary
+                            )
                         }
                     }
                 }
@@ -310,6 +393,41 @@ fun EditProfileScreen(
                     }
                 }
 
+                // Authoritative Mode toggle (DNSTT-based profiles only)
+                if (uiState.isDnsttBased) {
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(vertical = 8.dp),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text(
+                                text = "Authoritative Mode",
+                                style = MaterialTheme.typography.bodyLarge
+                            )
+                            Text(
+                                text = "Aggressive query rate for faster speeds",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                        }
+                        Switch(
+                            checked = uiState.dnsttAuthoritative,
+                            onCheckedChange = { viewModel.updateDnsttAuthoritative(it) }
+                        )
+                    }
+                    if (uiState.dnsttAuthoritative) {
+                        Text(
+                            text = "Only use when the DNS resolver is your own server. Public resolvers (Google, Cloudflare) will rate-limit and block your connection.",
+                            style = MaterialTheme.typography.bodySmall.copy(fontWeight = FontWeight.Bold),
+                            color = MaterialTheme.colorScheme.error,
+                            modifier = Modifier.padding(bottom = 8.dp)
+                        )
+                    }
+                }
+
                 // DoH URL for DNSTT with DoH transport
                 if (uiState.isDnsttBased && uiState.dnsTransport == DnsTransport.DOH) {
                     DohServerSelector(
@@ -324,7 +442,7 @@ fun EditProfileScreen(
                 }
 
                 // Resolvers (not shown for SSH-only, DOH, or DNSTT with DoH transport)
-                val showResolvers = !uiState.isSshOnly && !uiState.isDoh && !uiState.isSnowflake &&
+                val showResolvers = !uiState.isSshOnly && !uiState.isDoh && !uiState.isSnowflake && !uiState.isNaiveSsh &&
                         !(uiState.isDnsttBased && uiState.dnsTransport == DnsTransport.DOH)
                 if (showResolvers) {
                     val isDoT = uiState.isDnsttBased && uiState.dnsTransport == DnsTransport.DOT
@@ -332,7 +450,7 @@ fun EditProfileScreen(
                         value = uiState.resolvers,
                         onValueChange = { viewModel.updateResolvers(it) },
                         label = { Text("DNS Resolver") },
-                        placeholder = { Text(if (isDoT) "8.8.8.8:853" else "1.1.1.1:53") },
+                        placeholder = { Text(if (isDoT) "e.g. 8.8.8.8:853" else "e.g. 8.8.8.8:53") },
                         isError = uiState.resolversError != null,
                         supportingText = {
                             Text(uiState.resolversError ?: if (isDoT) "DNS-over-TLS server (IP:853)" else "DNS server address (IP:port)")
@@ -518,6 +636,13 @@ fun EditProfileScreen(
                                 .padding(vertical = 12.dp, horizontal = 4.dp),
                             verticalAlignment = Alignment.CenterVertically
                         ) {
+                            Spacer(Modifier.width(4.dp))
+                            Icon(
+                                Icons.Default.SmartToy,
+                                contentDescription = null,
+                                tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                                modifier = Modifier.size(20.dp)
+                            )
                             Spacer(Modifier.width(12.dp))
                             Column(modifier = Modifier.weight(1f)) {
                                 Text(
@@ -541,17 +666,18 @@ fun EditProfileScreen(
                     }
 
                     val context = LocalContext.current
+                    data class BridgeLink(val label: String, val description: String, val url: String, val icon: androidx.compose.ui.graphics.vector.ImageVector)
                     val bridgeLinks = listOf(
-                        Triple("Telegram", "Message @GetBridgesBot", "https://t.me/GetBridgesBot"),
-                        Triple("Web", "bridges.torproject.org", "https://bridges.torproject.org"),
-                        Triple("Gmail or Riseup", "bridges@torproject.org", "mailto:bridges@torproject.org")
+                        BridgeLink("Telegram", "Message @GetBridgesBot", "https://t.me/GetBridgesBot", Icons.Default.Send),
+                        BridgeLink("Web", "bridges.torproject.org", "https://bridges.torproject.org", Icons.Default.Language),
+                        BridgeLink("Gmail or Riseup", "bridges@torproject.org", "mailto:bridges@torproject.org", Icons.Default.Email)
                     )
-                    bridgeLinks.forEach { (label, description, url) ->
+                    bridgeLinks.forEach { link ->
                         Surface(
                             onClick = {
                                 val intent = android.content.Intent(
                                     android.content.Intent.ACTION_VIEW,
-                                    android.net.Uri.parse(url)
+                                    android.net.Uri.parse(link.url)
                                 )
                                 context.startActivity(intent)
                             },
@@ -565,15 +691,22 @@ fun EditProfileScreen(
                                     .padding(vertical = 12.dp, horizontal = 4.dp),
                                 verticalAlignment = Alignment.CenterVertically
                             ) {
+                                Spacer(Modifier.width(4.dp))
+                                Icon(
+                                    link.icon,
+                                    contentDescription = null,
+                                    tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                                    modifier = Modifier.size(20.dp)
+                                )
                                 Spacer(Modifier.width(12.dp))
                                 Column(modifier = Modifier.weight(1f)) {
                                     Text(
-                                        text = label,
+                                        text = link.label,
                                         style = MaterialTheme.typography.bodySmall,
                                         color = MaterialTheme.colorScheme.onSurfaceVariant
                                     )
                                     Text(
-                                        text = description,
+                                        text = link.description,
                                         style = MaterialTheme.typography.bodyLarge
                                     )
                                 }
@@ -633,6 +766,14 @@ fun EditProfileScreen(
                         Switch(
                             checked = uiState.authoritativeMode,
                             onCheckedChange = { viewModel.updateAuthoritativeMode(it) }
+                        )
+                    }
+                    if (uiState.authoritativeMode) {
+                        Text(
+                            text = "Only use when the DNS resolver is your own server. Public resolvers (Google, Cloudflare) will rate-limit and block your connection.",
+                            style = MaterialTheme.typography.bodySmall.copy(fontWeight = FontWeight.Bold),
+                            color = MaterialTheme.colorScheme.error,
+                            modifier = Modifier.padding(bottom = 8.dp)
                         )
                     }
 
@@ -751,8 +892,8 @@ fun EditProfileScreen(
                         modifier = Modifier.padding(top = 8.dp)
                     )
 
-                    // SSH Port (only for DNSTT+SSH / Slipstream+SSH, not SSH-only which has it near domain)
-                    if (uiState.showConnectionMethod) {
+                    // SSH Port (only for DNSTT+SSH / Slipstream+SSH / NAIVE_SSH, not SSH-only which has it near domain)
+                    if (uiState.showConnectionMethod || uiState.isNaiveSsh) {
                         OutlinedTextField(
                             value = uiState.sshPort,
                             onValueChange = { viewModel.updateSshPort(it) },
