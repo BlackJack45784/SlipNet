@@ -2,8 +2,10 @@ package app.slipnet.tunnel
 
 import app.slipnet.util.AppLog as Log
 import java.io.BufferedOutputStream
+import java.io.ByteArrayInputStream
 import java.io.InputStream
 import java.io.OutputStream
+import java.io.SequenceInputStream
 import java.net.InetSocketAddress
 import java.net.ServerSocket
 import java.net.Socket
@@ -16,58 +18,46 @@ import javax.net.ssl.SSLSocket
 import javax.net.ssl.SSLSocketFactory
 
 /**
- * SOCKS5 bridge for DNSTT standalone mode.
+ * SOCKS5 bridge for standalone NaiveProxy mode.
  *
- * DNSTT tunnels raw TCP to the remote server. The SOCKS5 handshake goes
- * through to the remote Dante proxy which requires user/pass auth and only
- * supports CONNECT (0x01), NOT FWD_UDP (0x05). This bridge sits between
- * hev-socks5-tunnel and DNSTT:
+ * NaiveProxy (Chromium-based) only supports SOCKS5 CONNECT (0x01) with NO_AUTH.
+ * hev-socks5-tunnel sends FWD_UDP (0x05) for DNS. This bridge sits between
+ * hev-socks5-tunnel and NaiveProxy:
  *
- * - CONNECT (0x01): Chains to DNSTT → Dante (with user/pass auth)
- * - FWD_UDP (0x05) DNS: DNS-over-TCP through persistent worker pool via Dante,
+ * - CONNECT (0x01): Chains to NaiveProxy's SOCKS5 (NO_AUTH)
+ * - FWD_UDP (0x05) DNS: DNS-over-TCP through persistent worker pool via NaiveProxy,
  *   falls back to DoH (Cloudflare 1.1.1.1) if all workers fail.
  * - FWD_UDP (0x05) non-DNS: Dropped silently (browser falls back to TCP CONNECT)
  *
  * Traffic flow:
- * App -> TUN -> hev-socks5-tunnel -> DnsttSocksBridge (proxyPort)
- *   TCP: -> SOCKS5 CONNECT (with auth) -> DNSTT (proxyPort+1) -> Dante -> Server
- *   DNS: -> FWD_UDP -> persistent DNS worker pool (via Dante) -> DNS server
+ * App -> TUN -> hev-socks5-tunnel -> NaiveSocksBridge (proxyPort)
+ *   TCP: -> SOCKS5 CONNECT (no auth) -> NaiveProxy (proxyPort+1) -> Caddy HTTPS -> Server
+ *   DNS: -> FWD_UDP -> persistent DNS worker pool (via NaiveProxy CONNECT to 8.8.8.8:53) -> DNS-over-TCP
  */
-object DnsttSocksBridge {
-    private const val TAG = "DnsttSocksBridge"
+object NaiveSocksBridge {
+    private const val TAG = "NaiveSocksBridge"
     @Volatile var debugLogging = false
+    @Volatile var domainRouter: DomainRouter = DomainRouter.DISABLED
     private fun logd(msg: String) { if (debugLogging) Log.d(TAG, msg) }
     private const val BIND_MAX_RETRIES = 10
     private const val BIND_RETRY_DELAY_MS = 200L
     private const val BUFFER_SIZE = 65536  // 64KB for better throughput
     private const val TCP_CONNECT_TIMEOUT_MS = 10000
-    private const val DNS_POOL_SIZE_DEFAULT = 5
-    private const val DNS_POOL_SIZE_AUTHORITATIVE = 10
+    private const val DNS_POOL_SIZE = 5
     private const val DNS_KEEPALIVE_INTERVAL_MS = 40_000L
-    @Volatile var authoritativeMode = false
-    private val dnsPoolSize: Int get() = if (authoritativeMode) DNS_POOL_SIZE_AUTHORITATIVE else DNS_POOL_SIZE_DEFAULT
     private const val DNS_WORKER_TIMEOUT_MS = 15_000
-    // Clean DNS resolved at the REMOTE server (through Dante SOCKS5 CONNECT).
-    // Dante may block CONNECT to localhost (127.0.0.53). Use public DNS instead.
     private const val PRIMARY_DNS_HOST = "8.8.8.8"
-    // Fallback if primary is unreachable through Dante
     private const val FALLBACK_DNS_HOST = "1.1.1.1"
 
-    private var dnsttHost: String = "127.0.0.1"
-    private var dnsttPort: Int = 0
-    private var socksUsername: String? = null
-    private var socksPassword: String? = null
+    private var naiveHost: String = "127.0.0.1"
+    private var naivePort: Int = 0
     private var serverSocket: ServerSocket? = null
     private var acceptorThread: Thread? = null
     private val running = AtomicBoolean(false)
     private val connectionThreads = CopyOnWriteArrayList<Thread>()
-    // Track all remote sockets (connections to DNSTT) for explicit cleanup
     private val remoteSockets = CopyOnWriteArrayList<Socket>()
 
     // --- DNS Worker Pool ---
-    // Persistent SOCKS5 connections through DNSTT→Dante to DNS server.
-    // Each worker holds an open TCP connection to the DNS server (via SOCKS5 CONNECT),
-    // allowing DNS-over-TCP queries without per-query connection overhead (~4 RTTs saved).
     private class DnsWorker(
         val socket: Socket,
         val input: InputStream,
@@ -77,41 +67,33 @@ object DnsttSocksBridge {
         val isAlive: Boolean get() = !socket.isClosed && socket.isConnected
     }
 
-    private var dnsWorkers = arrayOfNulls<DnsWorker>(DNS_POOL_SIZE_DEFAULT)
+    private val dnsWorkers = arrayOfNulls<DnsWorker>(DNS_POOL_SIZE)
     private val dnsRoundRobin = AtomicInteger(0)
     private var dnsTargetHost: String = PRIMARY_DNS_HOST
     private var dnsFallbackHost: String = FALLBACK_DNS_HOST
-    private var workerCreationLocks = Array(DNS_POOL_SIZE_DEFAULT) { ReentrantLock() }
+    private val workerCreationLocks = Array(DNS_POOL_SIZE) { ReentrantLock() }
     private var dnsKeepaliveThread: Thread? = null
 
     fun start(
-        dnsttPort: Int,
-        dnsttHost: String = "127.0.0.1",
+        naivePort: Int,
+        naiveHost: String = "127.0.0.1",
         listenPort: Int,
         listenHost: String = "127.0.0.1",
-        socksUsername: String? = null,
-        socksPassword: String? = null,
         dnsServer: String? = null,
         dnsFallback: String? = null
     ): Result<Unit> {
         Log.i(TAG, "========================================")
-        Log.i(TAG, "Starting DNSTT SOCKS5 bridge")
-        Log.i(TAG, "  DNSTT: $dnsttHost:$dnsttPort")
+        Log.i(TAG, "Starting NaiveProxy SOCKS5 bridge")
+        Log.i(TAG, "  NaiveProxy: $naiveHost:$naivePort")
         Log.i(TAG, "  Listen: $listenHost:$listenPort")
         Log.i(TAG, "  DNS: ${dnsServer ?: PRIMARY_DNS_HOST} (fallback: ${dnsFallback ?: FALLBACK_DNS_HOST})")
         Log.i(TAG, "========================================")
 
         stop()
-        this.dnsttHost = dnsttHost
-        this.dnsttPort = dnsttPort
-        this.socksUsername = socksUsername
-        this.socksPassword = socksPassword
+        this.naiveHost = naiveHost
+        this.naivePort = naivePort
         this.dnsTargetHost = dnsServer ?: PRIMARY_DNS_HOST
         this.dnsFallbackHost = dnsFallback ?: FALLBACK_DNS_HOST
-        // Resize worker pool based on authoritative mode
-        val poolSize = dnsPoolSize
-        dnsWorkers = arrayOfNulls(poolSize)
-        workerCreationLocks = Array(poolSize) { ReentrantLock() }
 
         return try {
             val ss = bindServerSocket(listenHost, listenPort)
@@ -131,7 +113,7 @@ object DnsttSocksBridge {
                     }
                 }
                 logd("Acceptor thread exited")
-            }, "dnstt-bridge-acceptor").also { it.isDaemon = true; it.start() }
+            }, "naive-bridge-acceptor").also { it.isDaemon = true; it.start() }
 
             // Pre-warm DNS worker pool in background
             prewarmDnsWorkers()
@@ -157,12 +139,10 @@ object DnsttSocksBridge {
         acceptorThread?.interrupt()
         acceptorThread = null
 
-        // Stop DNS keepalive
         dnsKeepaliveThread?.interrupt()
         dnsKeepaliveThread = null
 
-        // Close all DNS workers (connections to DNSTT port)
-        for (i in 0 until dnsPoolSize) {
+        for (i in 0 until DNS_POOL_SIZE) {
             val worker = dnsWorkers[i]
             dnsWorkers[i] = null
             if (worker != null) {
@@ -170,7 +150,6 @@ object DnsttSocksBridge {
             }
         }
 
-        // Close all remote sockets (CONNECT chains to DNSTT port)
         for (sock in remoteSockets) {
             try { sock.close() } catch (_: Exception) {}
         }
@@ -193,34 +172,29 @@ object DnsttSocksBridge {
 
     // --- DNS Worker Pool Management ---
 
-    /**
-     * Pre-warm DNS worker pool: open persistent SOCKS5 connections to the DNS server
-     * through DNSTT→Dante. Each worker is a ready-to-use DNS-over-TCP channel.
-     */
     private fun prewarmDnsWorkers() {
-        Log.i(TAG, "DNS workers target: $dnsTargetHost:53 (fallback: $dnsFallbackHost, pool=$dnsPoolSize)")
+        Log.i(TAG, "DNS workers target: $dnsTargetHost:53 (fallback: $dnsFallbackHost, pool=$DNS_POOL_SIZE)")
         val thread = Thread({
-            for (i in 0 until dnsPoolSize) {
+            for (i in 0 until DNS_POOL_SIZE) {
                 if (!running.get() || Thread.currentThread().isInterrupted) break
                 try {
                     val worker = createDnsWorker()
                     if (worker != null) {
                         dnsWorkers[i] = worker
-                        logd("DNS worker ${i + 1}/$dnsPoolSize ready → $dnsTargetHost:53")
+                        logd("DNS worker ${i + 1}/$DNS_POOL_SIZE ready → $dnsTargetHost:53")
                     } else {
                         logd("DNS worker ${i + 1} creation returned null")
                         break
                     }
                 } catch (e: Exception) {
                     if (i == 0) {
-                        // Primary DNS unreachable — fall back to secondary DNS
                         Log.w(TAG, "DNS worker 1 failed on $dnsTargetHost, falling back to $dnsFallbackHost")
                         dnsTargetHost = dnsFallbackHost
                         try {
                             val fallbackWorker = createDnsWorker()
                             if (fallbackWorker != null) {
                                 dnsWorkers[i] = fallbackWorker
-                                logd("DNS worker 1/$dnsPoolSize ready → $dnsTargetHost:53 (fallback)")
+                                logd("DNS worker 1/$DNS_POOL_SIZE ready → $dnsTargetHost:53 (fallback)")
                                 continue
                             }
                         } catch (e2: Exception) {
@@ -233,29 +207,28 @@ object DnsttSocksBridge {
                 }
             }
             val count = dnsWorkers.count { it != null }
-            Log.i(TAG, "DNS worker pool: $count/$dnsPoolSize ready → $dnsTargetHost:53")
-        }, "dnstt-dns-prewarm")
+            Log.i(TAG, "DNS worker pool: $count/$DNS_POOL_SIZE ready → $dnsTargetHost:53")
+        }, "naive-dns-prewarm")
         thread.isDaemon = true
         thread.start()
         startDnsKeepalive()
     }
 
     /**
-     * Create a single DNS worker: Socket → DNSTT → SOCKS5 auth → CONNECT to DNS:53.
-     * Returns a ready-to-use DnsWorker, or null on failure.
+     * Create a single DNS worker: Socket → NaiveProxy SOCKS5 (NO_AUTH) → CONNECT to DNS:53.
      */
     private fun createDnsWorker(): DnsWorker? {
         val sock = Socket()
         try {
-            sock.connect(InetSocketAddress(dnsttHost, dnsttPort), TCP_CONNECT_TIMEOUT_MS)
+            sock.connect(InetSocketAddress(naiveHost, naivePort), TCP_CONNECT_TIMEOUT_MS)
             sock.soTimeout = DNS_WORKER_TIMEOUT_MS
             sock.tcpNoDelay = true
 
             val sockIn = sock.getInputStream()
             val sockOut = sock.getOutputStream()
 
-            // SOCKS5 auth with Dante
-            if (!performSocksAuth(sockIn, sockOut)) {
+            // SOCKS5 greeting: NO_AUTH only
+            if (!performSocksGreeting(sockIn, sockOut)) {
                 sock.close()
                 return null
             }
@@ -279,9 +252,6 @@ object DnsttSocksBridge {
         }
     }
 
-    /**
-     * Recreate a dead DNS worker with creation lock to prevent duplicate recreation.
-     */
     private fun recreateDnsWorkerSync(idx: Int): DnsWorker? {
         try {
             if (!workerCreationLocks[idx].tryLock(1, TimeUnit.SECONDS)) return null
@@ -289,7 +259,6 @@ object DnsttSocksBridge {
             return null
         }
         try {
-            // Double-check: another thread may have already recreated it
             val existing = dnsWorkers[idx]
             if (existing != null && existing.isAlive) return existing
             existing?.let { try { it.socket.close() } catch (_: Exception) {} }
@@ -309,9 +278,6 @@ object DnsttSocksBridge {
         }
     }
 
-    /**
-     * Periodic health check: detect dead workers and recreate them proactively.
-     */
     private fun startDnsKeepalive() {
         dnsKeepaliveThread?.interrupt()
         dnsKeepaliveThread = Thread({
@@ -321,7 +287,7 @@ object DnsttSocksBridge {
 
             while (running.get() && !Thread.currentThread().isInterrupted) {
                 var deadCount = 0
-                for (i in 0 until dnsPoolSize) {
+                for (i in 0 until DNS_POOL_SIZE) {
                     val worker = dnsWorkers[i]
                     if (worker == null || !worker.isAlive) {
                         deadCount++
@@ -336,12 +302,9 @@ object DnsttSocksBridge {
                     Thread.sleep(DNS_KEEPALIVE_INTERVAL_MS)
                 } catch (_: InterruptedException) { break }
             }
-        }, "dnstt-dns-keepalive").also { it.isDaemon = true; it.start() }
+        }, "naive-dns-keepalive").also { it.isDaemon = true; it.start() }
     }
 
-    /**
-     * Build SOCKS5 address bytes for the DNS target (ATYP_IPV4 + IP + port 53).
-     */
     private fun buildDnsTargetAddr(host: String): ByteArray {
         val parts = host.split(".")
         return byteArrayOf(
@@ -354,10 +317,6 @@ object DnsttSocksBridge {
         )
     }
 
-    /**
-     * Send a DNS-over-TCP query on a persistent worker connection.
-     * Returns DNS response payload, or null on bad response.
-     */
     private fun sendDnsQuery(worker: DnsWorker, payload: ByteArray): ByteArray? {
         val lenBuf = ByteArray(2)
         lenBuf[0] = ((payload.size shr 8) and 0xFF).toByte()
@@ -379,18 +338,17 @@ object DnsttSocksBridge {
 
     /**
      * Forward DNS query through persistent worker pool with multi-phase resilience:
-     *
      * Phase 1: Try ALL existing live workers round-robin (non-blocking lock).
      * Phase 2: If all dead/busy, recreate ONE worker inline and use it.
-     * Phase 3: Last resort — open a per-query connection (still through DNSTT).
+     * Phase 3: Last resort — open a per-query connection (still through NaiveProxy).
      * Phase 4: DoH fallback if all TCP methods fail.
      */
     private fun forwardDnsPooled(payload: ByteArray): ByteArray? {
-        val startIdx = (dnsRoundRobin.getAndIncrement() and 0x7FFFFFFF) % dnsPoolSize
+        val startIdx = (dnsRoundRobin.getAndIncrement() and 0x7FFFFFFF) % DNS_POOL_SIZE
 
-        // Phase 1: Try all existing live workers (non-blocking lock to skip busy ones)
-        for (i in 0 until dnsPoolSize) {
-            val idx = (startIdx + i) % dnsPoolSize
+        // Phase 1: Try all existing live workers
+        for (i in 0 until DNS_POOL_SIZE) {
+            val idx = (startIdx + i) % DNS_POOL_SIZE
             val worker = dnsWorkers[idx] ?: continue
             if (!worker.isAlive) {
                 dnsWorkers[idx] = null
@@ -413,8 +371,8 @@ object DnsttSocksBridge {
         }
 
         // Phase 2: All workers dead/busy — recreate one inline
-        for (i in 0 until dnsPoolSize) {
-            val idx = (startIdx + i) % dnsPoolSize
+        for (i in 0 until DNS_POOL_SIZE) {
+            val idx = (startIdx + i) % DNS_POOL_SIZE
             val newWorker = recreateDnsWorkerSync(idx) ?: continue
             if (!newWorker.lock.tryLock(5, TimeUnit.SECONDS)) continue
             try {
@@ -429,7 +387,7 @@ object DnsttSocksBridge {
             break
         }
 
-        // Phase 3: Per-query fallback (old behavior — new connection per query)
+        // Phase 3: Per-query fallback
         logd("FWD_UDP: all workers failed, falling back to per-query connection")
         val tcpResult = forwardDnsTcpOneShot(payload)
         if (tcpResult != null) return tcpResult
@@ -498,7 +456,7 @@ object DnsttSocksBridge {
                     // Parse address
                     val addrType = input.read()
                     val destHost: String
-                    val rawAddr: ByteArray // raw SOCKS5 address bytes for CONNECT forwarding
+                    val rawAddr: ByteArray
 
                     when (addrType) {
                         0x01 -> { // IPv4
@@ -539,7 +497,7 @@ object DnsttSocksBridge {
                         return@Thread
                     }
 
-                    // Handle CONNECT (cmd 0x01) — chain through DNSTT
+                    // Handle CONNECT (cmd 0x01) — chain through NaiveProxy
                     handleConnect(destHost, destPort, rawAddr, portBytes, socket, input, output)
                 }
             } catch (e: Exception) {
@@ -547,7 +505,7 @@ object DnsttSocksBridge {
                     logd("Connection handler error: ${e.message}")
                 }
             }
-        }, "dnstt-bridge-handler")
+        }, "naive-bridge-handler")
         thread.isDaemon = true
         connectionThreads.add(thread)
         thread.start()
@@ -555,9 +513,6 @@ object DnsttSocksBridge {
         connectionThreads.removeAll { !it.isAlive }
     }
 
-    /**
-     * Handle SOCKS5 CONNECT by chaining through DNSTT's raw tunnel to Dante.
-     */
     private fun handleConnect(
         destHost: String,
         destPort: Int,
@@ -567,16 +522,102 @@ object DnsttSocksBridge {
         clientInput: InputStream,
         clientOutput: OutputStream
     ) {
+        val router = domainRouter
+        if (router.enabled) {
+            handleConnectWithRouting(router, destHost, destPort, rawAddr, portBytes, clientSocket, clientInput, clientOutput)
+            return
+        }
+
+        connectViaNaive(destHost, destPort, rawAddr, portBytes, clientSocket, clientInput, clientOutput, true)
+    }
+
+    private fun handleConnectWithRouting(
+        router: DomainRouter,
+        destHost: String,
+        destPort: Int,
+        rawAddr: ByteArray,
+        portBytes: ByteArray,
+        clientSocket: Socket,
+        clientInput: InputStream,
+        clientOutput: OutputStream
+    ) {
+        var effectiveHost = destHost
+        var sniffBuffer: ByteArray? = null
+        var sniffLen = 0
+        var wasEarlyReply = false
+
+        if (DomainRouter.isIpAddress(destHost)) {
+            clientOutput.write(byteArrayOf(0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0))
+            clientOutput.flush()
+            clientSocket.soTimeout = 3000
+            wasEarlyReply = true
+
+            val result = ProtocolSniffer.sniff(clientInput)
+            if (result.domain != null) {
+                effectiveHost = result.domain
+                logd("CONNECT: sniffed domain=$effectiveHost from IP=$destHost")
+            }
+            sniffBuffer = result.bufferedData
+            sniffLen = result.bufferedLength
+        }
+
+        if (router.shouldBypass(effectiveHost)) {
+            logd("CONNECT: bypassing tunnel for $effectiveHost:$destPort")
+            try {
+                val directSocket = router.createDirectConnection(destHost, destPort)
+                if (!wasEarlyReply) {
+                    clientOutput.write(byteArrayOf(0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0))
+                    clientOutput.flush()
+                }
+                clientSocket.soTimeout = 0
+                val effectiveInput = if (sniffLen > 0)
+                    SequenceInputStream(ByteArrayInputStream(sniffBuffer!!, 0, sniffLen), clientInput)
+                else clientInput
+                bridgeDirect(effectiveInput, clientOutput, directSocket)
+            } catch (e: Exception) {
+                logd("CONNECT: direct connection failed for $effectiveHost:$destPort: ${e.message}")
+                if (!wasEarlyReply) {
+                    try {
+                        clientOutput.write(byteArrayOf(0x05, 0x05, 0x00, 0x01, 0, 0, 0, 0, 0, 0))
+                        clientOutput.flush()
+                    } catch (_: Exception) {}
+                }
+            }
+            return
+        }
+
+        clientSocket.soTimeout = 0
+        val effectiveInput = if (sniffLen > 0)
+            SequenceInputStream(ByteArrayInputStream(sniffBuffer!!, 0, sniffLen), clientInput)
+        else clientInput
+        connectViaNaive(destHost, destPort, rawAddr, portBytes, clientSocket, effectiveInput, clientOutput, !wasEarlyReply)
+    }
+
+    /**
+     * Connect through NaiveProxy's SOCKS5 proxy (NO_AUTH) and bridge bidirectionally.
+     */
+    private fun connectViaNaive(
+        destHost: String,
+        destPort: Int,
+        rawAddr: ByteArray,
+        portBytes: ByteArray,
+        clientSocket: Socket,
+        clientInput: InputStream,
+        clientOutput: OutputStream,
+        sendReply: Boolean
+    ) {
         val remoteSocket: Socket
         try {
             remoteSocket = Socket()
-            remoteSocket.connect(InetSocketAddress(dnsttHost, dnsttPort), TCP_CONNECT_TIMEOUT_MS)
+            remoteSocket.connect(InetSocketAddress(naiveHost, naivePort), TCP_CONNECT_TIMEOUT_MS)
             remoteSocket.tcpNoDelay = true
             remoteSockets.add(remoteSocket)
         } catch (e: Exception) {
-            logd("CONNECT: failed to connect to DNSTT: ${e.message}")
-            clientOutput.write(byteArrayOf(0x05, 0x05, 0x00, 0x01, 0, 0, 0, 0, 0, 0))
-            clientOutput.flush()
+            logd("CONNECT: failed to connect to NaiveProxy: ${e.message}")
+            if (sendReply) {
+                clientOutput.write(byteArrayOf(0x05, 0x05, 0x00, 0x01, 0, 0, 0, 0, 0, 0))
+                clientOutput.flush()
+            }
             return
         }
 
@@ -584,28 +625,37 @@ object DnsttSocksBridge {
             val remoteInput = remoteSocket.getInputStream()
             val remoteOutput = remoteSocket.getOutputStream()
 
-            // SOCKS5 greeting to DNSTT → Dante (user/pass auth)
-            if (!performSocksAuth(remoteInput, remoteOutput)) {
-                Log.w(TAG, "CONNECT: Dante auth failed")
-                clientOutput.write(byteArrayOf(0x05, 0x01, 0x00, 0x01, 0, 0, 0, 0, 0, 0))
-                clientOutput.flush()
+            // SOCKS5 greeting to NaiveProxy (NO_AUTH)
+            remoteOutput.write(byteArrayOf(0x05, 0x01, 0x00))
+            remoteOutput.flush()
+
+            val greetResp = ByteArray(2)
+            remoteInput.readFully(greetResp)
+            if (greetResp[0] != 0x05.toByte() || (greetResp[1].toInt() and 0xFF) == 0xFF) {
+                Log.w(TAG, "CONNECT: NaiveProxy rejected greeting (${greetResp[0]}, ${greetResp[1]})")
+                if (sendReply) {
+                    clientOutput.write(byteArrayOf(0x05, 0x01, 0x00, 0x01, 0, 0, 0, 0, 0, 0))
+                    clientOutput.flush()
+                }
                 remoteSocket.close()
                 return
             }
 
-            // SOCKS5 CONNECT request to Dante
+            // SOCKS5 CONNECT request
             val connectReq = byteArrayOf(0x05, 0x01, 0x00) + rawAddr + portBytes
             remoteOutput.write(connectReq)
             remoteOutput.flush()
 
-            // Read CONNECT response header (4 bytes: ver, rep, rsv, atyp)
+            // Read CONNECT response
             val connRespHeader = ByteArray(4)
             remoteInput.readFully(connRespHeader)
 
             if (connRespHeader[1] != 0x00.toByte()) {
-                logd("CONNECT: Dante rejected to $destHost:$destPort (rep=${connRespHeader[1]})")
-                clientOutput.write(byteArrayOf(0x05, connRespHeader[1], 0x00, 0x01, 0, 0, 0, 0, 0, 0))
-                clientOutput.flush()
+                logd("CONNECT: NaiveProxy rejected to $destHost:$destPort (rep=${connRespHeader[1]})")
+                if (sendReply) {
+                    clientOutput.write(byteArrayOf(0x05, connRespHeader[1], 0x00, 0x01, 0, 0, 0, 0, 0, 0))
+                    clientOutput.flush()
+                }
                 remoteSocket.close()
                 return
             }
@@ -617,11 +667,12 @@ object DnsttSocksBridge {
                 0x04 -> { val rest = ByteArray(18); remoteInput.readFully(rest) }
             }
 
-            logd("CONNECT: $destHost:$destPort OK (via DNSTT)")
+            logd("CONNECT: $destHost:$destPort OK (via NaiveProxy)")
 
-            // Send success to hev-socks5-tunnel
-            clientOutput.write(byteArrayOf(0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0))
-            clientOutput.flush()
+            if (sendReply) {
+                clientOutput.write(byteArrayOf(0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0))
+                clientOutput.flush()
+            }
 
             clientSocket.soTimeout = 0
 
@@ -634,7 +685,7 @@ object DnsttSocksBridge {
                     } finally {
                         try { remoteOutput.close() } catch (_: Exception) {}
                     }
-                }, "dnstt-bridge-c2s")
+                }, "naive-bridge-c2s")
                 t1.isDaemon = true
                 t1.start()
 
@@ -649,20 +700,44 @@ object DnsttSocksBridge {
             }
         } catch (e: Exception) {
             logd("CONNECT: chain error for $destHost:$destPort: ${e.message}")
-            try {
-                clientOutput.write(byteArrayOf(0x05, 0x01, 0x00, 0x01, 0, 0, 0, 0, 0, 0))
-                clientOutput.flush()
-            } catch (_: Exception) {}
+            if (sendReply) {
+                try {
+                    clientOutput.write(byteArrayOf(0x05, 0x01, 0x00, 0x01, 0, 0, 0, 0, 0, 0))
+                    clientOutput.flush()
+                } catch (_: Exception) {}
+            }
             try { remoteSocket.close() } catch (_: Exception) {}
             remoteSockets.remove(remoteSocket)
         }
     }
 
-    /**
-     * Handle FWD_UDP (cmd 0x05) — same wire format as SshTunnelBridge/SlipstreamSocksBridge.
-     * DNS (port 53): through persistent worker pool, DoH fallback.
-     * Non-DNS UDP: dropped silently (browser falls back to TCP CONNECT).
-     */
+    private fun bridgeDirect(clientInput: InputStream, clientOutput: OutputStream, directSocket: Socket) {
+        directSocket.use { remote ->
+            remote.tcpNoDelay = true
+            val remoteInput = remote.getInputStream()
+            val remoteOutput = remote.getOutputStream()
+
+            val t1 = Thread({
+                try {
+                    copyStream(clientInput, remoteOutput)
+                } catch (_: Exception) {
+                } finally {
+                    try { remoteOutput.close() } catch (_: Exception) {}
+                }
+            }, "naive-bridge-direct-c2s")
+            t1.isDaemon = true
+            t1.start()
+
+            try {
+                copyStream(remoteInput, clientOutput)
+            } catch (_: Exception) {
+            } finally {
+                try { remote.close() } catch (_: Exception) {}
+                t1.interrupt()
+            }
+        }
+    }
+
     private fun handleFwdUdp(input: InputStream, output: OutputStream) {
         output.write(byteArrayOf(0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0))
         output.flush()
@@ -696,11 +771,9 @@ object DnsttSocksBridge {
 
             try {
                 val response = if (dest.second == 53) {
-                    // DNS: use persistent worker pool with multi-phase fallback
                     forwardDnsPooled(payload)
                 } else {
-                    // Non-DNS UDP (QUIC, etc.): drop silently.
-                    // Browser falls back to TCP → CONNECT through DNSTT.
+                    // Non-DNS UDP: drop silently
                     null
                 }
 
@@ -725,22 +798,18 @@ object DnsttSocksBridge {
         logd("FWD_UDP session ended")
     }
 
-    /**
-     * One-shot DNS-over-TCP through a new DNSTT connection (Phase 3 fallback).
-     * Used when all persistent workers are dead and recreation failed.
-     */
     private fun forwardDnsTcpOneShot(payload: ByteArray): ByteArray? {
         var sock: Socket? = null
         try {
             sock = Socket()
-            sock.connect(InetSocketAddress(dnsttHost, dnsttPort), TCP_CONNECT_TIMEOUT_MS)
+            sock.connect(InetSocketAddress(naiveHost, naivePort), TCP_CONNECT_TIMEOUT_MS)
             sock.soTimeout = DNS_WORKER_TIMEOUT_MS
             sock.tcpNoDelay = true
 
             val sockIn = sock.getInputStream()
             val sockOut = sock.getOutputStream()
 
-            if (!performSocksAuth(sockIn, sockOut)) return null
+            if (!performSocksGreeting(sockIn, sockOut)) return null
 
             val dnsAddr = buildDnsTargetAddr(dnsTargetHost)
             val connectReq = byteArrayOf(0x05, 0x01, 0x00) + dnsAddr
@@ -783,26 +852,23 @@ object DnsttSocksBridge {
     }
 
     /**
-     * Forward DNS query via DoH (DNS-over-HTTPS) through DNSTT → Dante tunnel.
-     * Fallback when DNS-over-TCP fails. Uses Cloudflare DoH (1.1.1.1).
+     * Forward DNS query via DoH through NaiveProxy SOCKS5 CONNECT to 1.1.1.1:443.
      */
     private fun forwardDnsDoH(payload: ByteArray): ByteArray? {
         var rawSocket: Socket? = null
         var sslSocket: SSLSocket? = null
         try {
-            // Step 1: Connect to DNSTT (loopback)
             rawSocket = Socket()
-            rawSocket.connect(InetSocketAddress(dnsttHost, dnsttPort), TCP_CONNECT_TIMEOUT_MS)
+            rawSocket.connect(InetSocketAddress(naiveHost, naivePort), TCP_CONNECT_TIMEOUT_MS)
             rawSocket.soTimeout = DNS_WORKER_TIMEOUT_MS
             rawSocket.tcpNoDelay = true
 
             val rawIn = rawSocket.getInputStream()
             val rawOut = rawSocket.getOutputStream()
 
-            // Step 2: SOCKS5 auth to Dante (through DNSTT tunnel)
-            if (!performSocksAuth(rawIn, rawOut)) return null
+            if (!performSocksGreeting(rawIn, rawOut)) return null
 
-            // Step 3: SOCKS5 CONNECT to Cloudflare DoH (1.1.1.1:443)
+            // SOCKS5 CONNECT to Cloudflare DoH (1.1.1.1:443)
             rawOut.write(byteArrayOf(
                 0x05, 0x01, 0x00, 0x01,        // SOCKS5 CONNECT IPv4
                 0x01, 0x01, 0x01, 0x01,        // 1.1.1.1
@@ -815,7 +881,6 @@ object DnsttSocksBridge {
                 return null
             }
 
-            // Step 4: TLS handshake over the SOCKS tunnel
             val sslFactory = SSLSocketFactory.getDefault() as SSLSocketFactory
             sslSocket = sslFactory.createSocket(rawSocket, "cloudflare-dns.com", 443, true) as SSLSocket
             sslSocket.startHandshake()
@@ -823,7 +888,6 @@ object DnsttSocksBridge {
             val tlsIn = sslSocket.inputStream
             val tlsOut = sslSocket.outputStream
 
-            // Step 5: HTTP POST for DoH (RFC 8484)
             val httpReq = ("POST /dns-query HTTP/1.1\r\n" +
                 "Host: cloudflare-dns.com\r\n" +
                 "Content-Type: application/dns-message\r\n" +
@@ -835,7 +899,6 @@ object DnsttSocksBridge {
             tlsOut.write(payload)
             tlsOut.flush()
 
-            // Step 6: Read HTTP response
             return readDoHResponse(tlsIn)
         } catch (e: Exception) {
             logd("DoH DNS failed: ${e.message}")
@@ -847,44 +910,17 @@ object DnsttSocksBridge {
     }
 
     /**
-     * Perform SOCKS5 greeting and user/pass auth with Dante.
-     * Returns true on success.
+     * Perform SOCKS5 greeting with NO_AUTH (0x00).
      */
-    private fun performSocksAuth(input: InputStream, output: OutputStream): Boolean {
-        val hasAuth = !socksUsername.isNullOrBlank() && !socksPassword.isNullOrBlank()
-        if (hasAuth) {
-            output.write(byteArrayOf(0x05, 0x01, 0x02))
-        } else {
-            output.write(byteArrayOf(0x05, 0x01, 0x00))
-        }
+    private fun performSocksGreeting(input: InputStream, output: OutputStream): Boolean {
+        output.write(byteArrayOf(0x05, 0x01, 0x00))
         output.flush()
 
         val greetResp = ByteArray(2)
         input.readFully(greetResp)
-        if (greetResp[0] != 0x05.toByte() || (greetResp[1].toInt() and 0xFF) == 0xFF) return false
-
-        if ((greetResp[1].toInt() and 0xFF) == 0x02) {
-            val user = socksUsername!!.toByteArray()
-            val pass = socksPassword!!.toByteArray()
-            val authReq = ByteArray(3 + user.size + pass.size)
-            authReq[0] = 0x01
-            authReq[1] = user.size.toByte()
-            System.arraycopy(user, 0, authReq, 2, user.size)
-            authReq[2 + user.size] = pass.size.toByte()
-            System.arraycopy(pass, 0, authReq, 3 + user.size, pass.size)
-            output.write(authReq)
-            output.flush()
-
-            val authResp = ByteArray(2)
-            input.readFully(authResp)
-            if (authResp[1] != 0x00.toByte()) return false
-        }
-        return true
+        return greetResp[0] == 0x05.toByte() && greetResp[1] == 0x00.toByte()
     }
 
-    /**
-     * Read and validate SOCKS5 CONNECT response. Returns true on success.
-     */
     private fun readSocksConnectResponse(input: InputStream): Boolean {
         val connResp = ByteArray(4)
         input.readFully(connResp)
@@ -897,9 +933,6 @@ object DnsttSocksBridge {
         return true
     }
 
-    /**
-     * Read an HTTP response and extract the body (DNS response bytes).
-     */
     private fun readDoHResponse(input: InputStream): ByteArray? {
         val headerLines = mutableListOf<String>()
         val lineBuf = StringBuilder()
